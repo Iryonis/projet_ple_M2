@@ -25,14 +25,12 @@ import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
 /**
- * Job MapReduce pour nettoyer et valider des données de parties de jeu.
- * Vérifie que chaque ligne JSON est valide et respecte les règles métier.
+ * Job MapReduce to clean the raw game data and remove duplicates.
  */
 public class DataCleaner extends Configured implements Tool {
 
   /**
-   * Mapper qui valide chaque ligne JSON et extrait une clé unique pour détecter
-   * les doublons.
+   * Mapper who validates and extracts a unique key for each game entry.
    */
   public static class CleanMapper
     extends Mapper<LongWritable, Text, Text, Text> {
@@ -46,7 +44,7 @@ public class DataCleaner extends Configured implements Tool {
       throws IOException, InterruptedException {
       String line = value.toString().trim();
 
-      // PARSING JSON UNE SEULE FOIS
+      // JSon parsing
       JsonObject game;
       try {
         game = gson.fromJson(line, JsonObject.class);
@@ -57,13 +55,13 @@ public class DataCleaner extends Configured implements Tool {
         return;
       }
 
-      // Validation et extraction en un seul passage
+      // Validate and extract unique key
       String uniqueKey = validateAndExtract(game);
       if (uniqueKey == null) {
         return;
       }
 
-      // Utiliser les données déjà extraites
+      // Put sorted player utags, date (YYYY-MM-DD), and round for the key and the full line as value
       outputKey.set(uniqueKey);
       outputValue.set(line);
 
@@ -71,21 +69,25 @@ public class DataCleaner extends Configured implements Tool {
     }
 
     /**
-     * Valide le JSON et extrait toutes les données nécessaires en un seul passage.
-     * Retourne la clé unique ou null si invalide.
+     * Validate the game JSON object and extract a unique key.
+     * The key is composed of sorted player utags, date (YYYY-MM-DD), and round.
+     * Returns null if validation fails.
+     * @param game JsonObject representing the game
+     * @return unique key string or null if invalid
      */
     private String validateAndExtract(JsonObject game) {
       try {
-        // Fail-fast : extraire directement sans vérifications multiples
+        // Extract players array and check if it has exactly 2 players
         JsonArray players = game.getAsJsonArray("players");
         if (players == null || players.size() != 2) {
           return null;
         }
 
+        // Extract the two player objects
         JsonObject player0 = players.get(0).getAsJsonObject();
         JsonObject player1 = players.get(1).getAsJsonObject();
 
-        // Extraire directement les champs nécessaires
+        // Extract required fields (utags, decks, date, round)
         String utag0 = player0.get("utag").getAsString();
         String utag1 = player1.get("utag").getAsString();
         String deck0 = player0.get("deck").getAsString();
@@ -93,15 +95,15 @@ public class DataCleaner extends Configured implements Tool {
         String dateStr = game.get("date").getAsString();
         int round = game.get("round").getAsInt();
 
-        // Validation rapide des decks (8 cartes exactement)
+        // Validate that each decks has exactly 16 characters (so 8 cards of 2 chars (hexadecimal))
         if (deck0.length() != 16 || deck1.length() != 16) {
           return null;
         }
 
-        // Extraire la date (juste YYYY-MM-DD)
+        // Extract date part without hours (YYYY-MM-DD)
         String dateOnly = dateStr.substring(0, 10);
 
-        // Trier les utags pour normaliser la clé
+        // Sort utags to normalize the key
         String sortedUtag0, sortedUtag1;
         if (utag0.compareTo(utag1) < 0) {
           sortedUtag0 = utag0;
@@ -111,7 +113,7 @@ public class DataCleaner extends Configured implements Tool {
           sortedUtag1 = utag0;
         }
 
-        // Retourner directement la clé
+        // Return the composite key
         return String.format(
           "%s|%s|%s|%d",
           sortedUtag0,
@@ -126,8 +128,7 @@ public class DataCleaner extends Configured implements Tool {
   }
 
   /**
-   * Combiner qui élimine les doublons exacts localement avant l'envoi au Reducer.
-   * Réduit le volume de données transitant sur le réseau.
+   * Delete exact duplicates in the Combiner to reduce data sent to Reducer.
    */
   public static class CleanCombiner extends Reducer<Text, Text, Text, Text> {
 
@@ -136,12 +137,13 @@ public class DataCleaner extends Configured implements Tool {
     @Override
     protected void reduce(Text key, Iterable<Text> values, Context context)
       throws IOException, InterruptedException {
+      // Clean the set for each key
       seenLines.clear();
 
+      // For each value, add and emit only unique lines (not already seen)
       for (Text value : values) {
         String line = value.toString();
 
-        // Déduplication simple avec la ligne complète
         if (!seenLines.contains(line)) {
           seenLines.add(line);
           context.write(key, value);
@@ -150,48 +152,47 @@ public class DataCleaner extends Configured implements Tool {
     }
   }
 
+  // Reducer that eliminates games with timestamps within ±10 seconds
+  // and exact duplicates that passed through the Combiner
   public static class CleanReducer
     extends Reducer<Text, Text, NullWritable, Text> {
 
     private final Gson gson = new Gson();
     private static final long TIME_THRESHOLD_SECONDS = 10;
-    private final Set<Integer> seenHashes = new HashSet<>();
+    private final Set<String> seenLines = new HashSet<>();
 
     @Override
     protected void reduce(Text key, Iterable<Text> values, Context context)
       throws IOException, InterruptedException {
+      // Clean the set for each key
+      seenLines.clear();
       List<GameEntry> games = new ArrayList<>();
 
-      // Collecter toutes les parties avec cette clé
+      // Delete exact duplicates and parse timestamps
       for (Text value : values) {
         String line = value.toString();
 
-        // Utiliser hashCode() natif (bien plus rapide que SHA-256)
-        int lineHash = line.hashCode();
-
-        // Éliminer les doublons exacts via hash
-        if (seenHashes.contains(lineHash)) {
-          continue;
-        }
-        seenHashes.add(lineHash);
-
-        try {
-          JsonObject game = gson.fromJson(line, JsonObject.class);
-          String dateStr = game.get("date").getAsString();
-          Instant timestamp = Instant.parse(dateStr);
-          games.add(new GameEntry(line, timestamp));
-        } catch (Exception e) {
-          // Si erreur de parsing, on garde quand même la ligne
-          context.write(NullWritable.get(), value);
+        if (!seenLines.contains(line)) {
+          seenLines.add(line);
+          // Parse JSON and extract timestamp
+          // If parsing fails, emit the original line as is
+          try {
+            JsonObject game = gson.fromJson(line, JsonObject.class);
+            String dateStr = game.get("date").getAsString();
+            Instant timestamp = Instant.parse(dateStr);
+            games.add(new GameEntry(line, timestamp));
+          } catch (Exception e) {
+            context.write(NullWritable.get(), value);
+          }
         }
       }
 
-      // Éliminer les parties avec timestamps proches (±10 secondes)
+      // Eliminate games with close timestamps (±10 seconds)
       for (int i = 0; i < games.size(); i++) {
         GameEntry current = games.get(i);
         boolean isDuplicate = false;
 
-        // Vérifier si une partie antérieure proche existe déjà
+        // Check if any previous game is within the time threshold
         for (int j = 0; j < i; j++) {
           GameEntry previous = games.get(j);
           long secondsDiff = Math.abs(
@@ -208,11 +209,9 @@ public class DataCleaner extends Configured implements Tool {
           context.write(NullWritable.get(), new Text(current.line));
         }
       }
-
-      // Nettoyer le HashSet pour éviter l'accumulation mémoire
-      seenHashes.clear();
     }
 
+    // Helper class to store game line and its timestamp
     private static class GameEntry {
 
       final String line;
