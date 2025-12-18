@@ -1,6 +1,6 @@
 package com.ple;
 
-import com.google.gson.Gson; // Gson for small files / Try Jackson for bigger ?
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.IOException;
@@ -15,22 +15,27 @@ import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.compress.SnappyCodec;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
 /**
- * Job MapReduce to clean the raw game data and remove duplicates.
+ * MapReduce job to clean raw game data and remove duplicates.
+ * Outputs cleaned data in SequenceFile format for optimal performance in subsequent jobs.
  */
 public class DataCleaner extends Configured implements Tool {
 
   /**
-   * Mapper who validates and extracts a unique key for each game entry.
+   * Mapper that validates and extracts a unique key for each game entry.
    */
   public static class CleanMapper
     extends Mapper<LongWritable, Text, Text, Text> {
@@ -44,7 +49,7 @@ public class DataCleaner extends Configured implements Tool {
       throws IOException, InterruptedException {
       String line = value.toString().trim();
 
-      // JSon parsing
+      // Parse JSON
       JsonObject game;
       try {
         game = gson.fromJson(line, JsonObject.class);
@@ -61,17 +66,18 @@ public class DataCleaner extends Configured implements Tool {
         return;
       }
 
-      // Put sorted player utags, date (YYYY-MM-DD), and round for the key and the full line as value
+      // Emit sorted player utags, date (YYYY-MM-DD), and round as key, full line as value
       outputKey.set(uniqueKey);
       outputValue.set(line);
 
       context.write(outputKey, outputValue);
+      context.getCounter("DataCleaner", "Mapper Output Lines").increment(1);
     }
 
     /**
-     * Validate the game JSON object and extract a unique key.
+     * Validates the game JSON object and extracts a unique key.
      * The key is composed of sorted player utags, date (YYYY-MM-DD), and round.
-     * Returns null if validation fails.
+     * 
      * @param game JsonObject representing the game
      * @return unique key string or null if invalid
      */
@@ -95,12 +101,12 @@ public class DataCleaner extends Configured implements Tool {
         String dateStr = game.get("date").getAsString();
         int round = game.get("round").getAsInt();
 
-        // Validate that each decks has exactly 16 characters (so 8 cards of 2 chars (hexadecimal))
+        // Validate that each deck has exactly 16 characters (8 cards × 2 hex chars)
         if (deck0.length() != 16 || deck1.length() != 16) {
           return null;
         }
 
-        // Extract date part without hours (YYYY-MM-DD)
+        // Extract date part without time (YYYY-MM-DD)
         String dateOnly = dateStr.substring(0, 10);
 
         // Sort utags to normalize the key
@@ -128,7 +134,7 @@ public class DataCleaner extends Configured implements Tool {
   }
 
   /**
-   * Delete exact duplicates in the Combiner to reduce data sent to Reducer.
+   * Combiner that removes exact duplicates locally to reduce data sent to Reducer.
    */
   public static class CleanCombiner extends Reducer<Text, Text, Text, Text> {
 
@@ -137,23 +143,31 @@ public class DataCleaner extends Configured implements Tool {
     @Override
     protected void reduce(Text key, Iterable<Text> values, Context context)
       throws IOException, InterruptedException {
-      // Clean the set for each key
+      // Clear the set for each key
       seenLines.clear();
 
-      // For each value, add and emit only unique lines (not already seen)
+      // For each value, emit only unique lines (not already seen)
       for (Text value : values) {
         String line = value.toString();
 
         if (!seenLines.contains(line)) {
           seenLines.add(line);
           context.write(key, value);
+          context
+            .getCounter("DataCleaner", "Combiner Output Lines")
+            .increment(1);
+        } else {
+          context
+            .getCounter("DataCleaner", "Combiner Exact Duplicates Removed")
+            .increment(1);
         }
       }
     }
   }
 
-  // Reducer that eliminates games with timestamps within ±10 seconds
-  // and exact duplicates that passed through the Combiner
+  /**
+   * Reducer that eliminates exact duplicates and games with timestamps within ±10 seconds.
+   */
   public static class CleanReducer
     extends Reducer<Text, Text, NullWritable, Text> {
 
@@ -164,18 +178,18 @@ public class DataCleaner extends Configured implements Tool {
     @Override
     protected void reduce(Text key, Iterable<Text> values, Context context)
       throws IOException, InterruptedException {
-      // Clean the set for each key
+      // Clear the set for each key
       seenLines.clear();
       List<GameEntry> games = new ArrayList<>();
 
-      // Delete exact duplicates and parse timestamps
+      // Remove exact duplicates and parse timestamps
       for (Text value : values) {
         String line = value.toString();
 
         if (!seenLines.contains(line)) {
           seenLines.add(line);
           // Parse JSON and extract timestamp
-          // If parsing fails, emit the original line as is
+          // If parsing fails, emit the original line as-is
           try {
             JsonObject game = gson.fromJson(line, JsonObject.class);
             String dateStr = game.get("date").getAsString();
@@ -183,35 +197,60 @@ public class DataCleaner extends Configured implements Tool {
             games.add(new GameEntry(line, timestamp));
           } catch (Exception e) {
             context.write(NullWritable.get(), value);
+            context
+              .getCounter("DataCleaner", "Reducer Output Lines")
+              .increment(1);
           }
+        } else {
+          context
+            .getCounter("DataCleaner", "Reducer Exact Duplicates Removed")
+            .increment(1);
         }
       }
 
-      // Eliminate games with close timestamps (±10 seconds)
+      // Sort by timestamp (ascending order) with tie-breaker for deterministic results
+      games.sort((a, b) -> {
+        int timestampCompare = a.timestamp.compareTo(b.timestamp);
+        if (timestampCompare != 0) return timestampCompare;
+        return a.line.compareTo(b.line); // Tie-breaker: lexicographic order
+      });
+
+      // Remove games with close timestamps (±10 seconds window)
       for (int i = 0; i < games.size(); i++) {
         GameEntry current = games.get(i);
         boolean isDuplicate = false;
 
-        // Check if any previous game is within the time threshold
-        for (int j = 0; j < i; j++) {
+        // Check only previous games within the time threshold (backward search)
+        for (int j = i - 1; j >= 0; j--) {
           GameEntry previous = games.get(j);
-          long secondsDiff = Math.abs(
-            ChronoUnit.SECONDS.between(previous.timestamp, current.timestamp)
+          long secondsDiff = ChronoUnit.SECONDS.between(
+            previous.timestamp,
+            current.timestamp
           );
 
-          if (secondsDiff <= TIME_THRESHOLD_SECONDS) {
-            isDuplicate = true;
+          // Break early if outside the time window (optimization)
+          if (secondsDiff > TIME_THRESHOLD_SECONDS) {
             break;
           }
+
+          isDuplicate = true;
+          context
+            .getCounter("DataCleaner", "Reducer Temporal Duplicates Removed")
+            .increment(1);
         }
 
         if (!isDuplicate) {
           context.write(NullWritable.get(), new Text(current.line));
+          context
+            .getCounter("DataCleaner", "Reducer Output Lines")
+            .increment(1);
         }
       }
     }
 
-    // Helper class to store game line and its timestamp
+    /**
+     * Helper class to store game line and its timestamp.
+     */
     private static class GameEntry {
 
       final String line;
@@ -226,34 +265,74 @@ public class DataCleaner extends Configured implements Tool {
 
   @Override
   public int run(String[] args) throws Exception {
-    if (args.length != 2) {
-      System.err.println("Usage: DataCleaner <input> <output>");
+    if (args.length < 2 || args.length > 3) {
+      System.err.println("Usage: DataCleaner <input> <output> [numReducers]");
+      System.err.println("  numReducers: optional, default is 1");
       return 1;
     }
 
     long startTime = System.currentTimeMillis();
-    System.out.println("=== Démarrage du job Data Cleaner ===");
+    System.out.println("=== Starting Data Cleaner Job ===");
 
     Configuration conf = getConf();
     Job job = Job.getInstance(conf, "Data Cleaner");
     job.setJarByClass(DataCleaner.class);
 
-    // Configuration du Mapper
+    // Mapper configuration
     job.setMapperClass(CleanMapper.class);
     job.setMapOutputKeyClass(Text.class);
     job.setMapOutputValueClass(Text.class);
 
-    // Configuration du Combiner
+    // Combiner configuration
     job.setCombinerClass(CleanCombiner.class);
 
-    // Configuration du Reducer
+    // Reducer configuration
     job.setReducerClass(CleanReducer.class);
     job.setOutputKeyClass(NullWritable.class);
     job.setOutputValueClass(Text.class);
 
-    // Chemins d'entrée/sortie
+    // Input/Output format configuration
+    job.setInputFormatClass(TextInputFormat.class);
+    job.setOutputFormatClass(SequenceFileOutputFormat.class);
+    
+    // Enable Snappy compression for SequenceFile
+    SequenceFileOutputFormat.setCompressOutput(job, true);
+    SequenceFileOutputFormat.setOutputCompressorClass(job, SnappyCodec.class);
+    SequenceFileOutputFormat.setOutputCompressionType(
+      job,
+      SequenceFile.CompressionType.BLOCK
+    );
+
+    // Determine number of reducers
+    int numReducers = 1; // Default value
+    if (args.length == 3) {
+      try {
+        numReducers = Integer.parseInt(args[2]);
+        if (numReducers < 1) {
+          System.err.println("Error: numReducers must be >= 1");
+          return 1;
+        }
+      } catch (NumberFormatException e) {
+        System.err.println("Error: numReducers must be an integer");
+        return 1;
+      }
+    }
+    job.setNumReduceTasks(numReducers);
+    System.out.println("Number of Reducers: " + numReducers);
+
+    // Input/Output paths
+    Path outputPath = new Path(args[1]);
     FileInputFormat.addInputPath(job, new Path(args[0]));
-    FileOutputFormat.setOutputPath(job, new Path(args[1]));
+    FileOutputFormat.setOutputPath(job, outputPath);
+
+    // Delete output directory if it exists
+    org.apache.hadoop.fs.FileSystem fs = org.apache.hadoop.fs.FileSystem.get(
+      conf
+    );
+    if (fs.exists(outputPath)) {
+      fs.delete(outputPath, true);
+      System.out.println("Output directory deleted: " + args[1]);
+    }
 
     boolean success = job.waitForCompletion(true);
 
@@ -263,9 +342,9 @@ public class DataCleaner extends Configured implements Tool {
     long minutes = seconds / 60;
     long remainingSeconds = seconds % 60;
 
-    System.out.println("\n=== Job terminé ===");
+    System.out.println("\n=== Job Completed ===");
     System.out.printf(
-      "Temps d'exécution: %d min %d sec (%.2f sec)%n",
+      "Execution time: %d min %d sec (%.2f sec)%n",
       minutes,
       remainingSeconds,
       durationMs / 1000.0
