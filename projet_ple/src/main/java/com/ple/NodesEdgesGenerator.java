@@ -4,6 +4,9 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
@@ -21,11 +24,11 @@ import org.apache.hadoop.util.ToolRunner;
 /**
  * MapReduce job to generate nodes and edges from cleaned game data.
  *
- * Nodes: All unique decks with their occurrence count and win count.
+ * Nodes: All unique decks AND archetypes (sub-decks of 1-7 cards) with their occurrence count and win count.
  * Edges: All deck matchups with match count and win count (directional).
  *
  * This job runs two sequential MapReduce jobs:
- * 1. NodesJob: Generates deck statistics (archetype;count;wins)
+ * 1. NodesJob: Generates deck and archetype statistics (archetype;count;wins)
  * 2. EdgesJob: Generates matchup statistics (source;target;count;wins)
  */
 public class NodesEdgesGenerator extends Configured implements Tool {
@@ -35,7 +38,10 @@ public class NodesEdgesGenerator extends Configured implements Tool {
   /**
    * Mapper for nodes generation.
    * Reads SequenceFile input (NullWritable, Text) from DataCleaner output.
-   * Emits (deck, "1,1") for each win and (deck, "1,0") for each loss.
+   * Emits:
+   * - Full deck (8 cards)
+   * - All archetypes (sub-decks of 1-7 cards)
+   * Format: (archetype, "1,1") for wins, (archetype, "1,0") for losses
    */
   public static class NodesMapper
     extends Mapper<NullWritable, Text, Text, Text> {
@@ -69,10 +75,12 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         return; // Skip invalid JSON
       }
 
-      // Extract players array
+      // Extract players array and winner
       JsonArray players;
+      int winner;
       try {
         players = game.getAsJsonArray("players");
+        winner = game.get("winner").getAsInt();
         if (players == null || players.size() != 2) {
           return;
         }
@@ -85,16 +93,81 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         try {
           JsonObject player = players.get(i).getAsJsonObject();
           String deck = player.get("deck").getAsString();
-          boolean win = player.get("win").getAsBoolean();
+          boolean win = (i == winner);
 
-          outputKey.set(deck);
-          // Format: "count,wins" where count is always 1, wins is 0 or 1
-          outputValue.set(win ? "1,1" : "1,0");
-
-          context.write(outputKey, outputValue);
+          // Generate all archetypes (sub-decks) for this deck
+          List<String> archetypes = generateArchetypes(deck);
+          
+          String valueStr = win ? "1,1" : "1,0";
+          outputValue.set(valueStr);
+          
+          // Emit all archetypes
+          for (String archetype : archetypes) {
+            outputKey.set(archetype);
+            context.write(outputKey, outputValue);
+          }
         } catch (Exception e) {
           continue; // Skip this player if parsing fails
         }
+      }
+    }
+    
+    /**
+     * Generates all archetypes (sub-decks) from a full deck.
+     * An archetype is any combination of 1 to 7 cards from the 8-card deck.
+     * Cards are kept in sorted order to normalize archetypes.
+     * 
+     * @param deck The full deck as a 16-character hex string (8 cards × 2 chars)
+     * @return List of all archetype strings
+     */
+    private List<String> generateArchetypes(String deck) {
+      List<String> archetypes = new ArrayList<>();
+      
+      // Parse deck into individual cards (2 hex chars each)
+      List<String> cards = new ArrayList<>();
+      for (int i = 0; i < deck.length(); i += 2) {
+        cards.add(deck.substring(i, i + 2));
+      }
+      
+      // Sort cards to normalize archetypes
+      Collections.sort(cards);
+      
+      // Generate all combinations of size 1 to 7
+      for (int size = 1; size <= 7; size++) {
+        generateCombinations(cards, size, 0, new ArrayList<>(), archetypes);
+      }
+      
+      // Also add the full deck (8 cards)
+      archetypes.add(String.join("", cards));
+      
+      return archetypes;
+    }
+    
+    /**
+     * Recursive helper to generate all combinations of a given size.
+     * 
+     * @param cards       List of all cards
+     * @param size        Target combination size
+     * @param start       Current starting index
+     * @param current     Current combination being built
+     * @param archetypes  Output list to collect archetypes
+     */
+    private void generateCombinations(
+      List<String> cards, 
+      int size, 
+      int start, 
+      List<String> current, 
+      List<String> archetypes
+    ) {
+      if (current.size() == size) {
+        archetypes.add(String.join("", current));
+        return;
+      }
+      
+      for (int i = start; i < cards.size(); i++) {
+        current.add(cards.get(i));
+        generateCombinations(cards, size, i + 1, current, archetypes);
+        current.remove(current.size() - 1);
       }
     }
   }
@@ -214,10 +287,12 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         return; // Skip invalid JSON
       }
 
-      // Extract players array
+      // Extract players array and winner
       JsonArray players;
+      int winner;
       try {
         players = game.getAsJsonArray("players");
+        winner = game.get("winner").getAsInt();
         if (players == null || players.size() != 2) {
           return;
         }
@@ -232,8 +307,8 @@ public class NodesEdgesGenerator extends Configured implements Tool {
 
         String deck0 = player0.get("deck").getAsString();
         String deck1 = player1.get("deck").getAsString();
-        boolean win0 = player0.get("win").getAsBoolean();
-        boolean win1 = player1.get("win").getAsBoolean();
+        boolean win0 = (winner == 0);
+        boolean win1 = (winner == 1);
 
         // Emit edge from player0's perspective: deck0 vs deck1
         outputKey.set(deck0 + "|" + deck1);
