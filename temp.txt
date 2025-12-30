@@ -394,7 +394,7 @@ Temps d'exécution: 0 min 43 sec (43.56 sec)
 === Job terminé ===
 Temps d'exécution: 0 min 43 sec (43.56 sec)
 
-35M
+37M
 
 25/12/18 16:02:31 INFO mapreduce.Job: Counters: 60
         File System Counters
@@ -467,3 +467,95 @@ Temps d'exécution: 0 min 43 sec (43.56 sec)
 
 === Job terminé ===
 Temps d'exécution: 1 min 38 sec (98.65 sec)
+
+        DataCleaner
+                Combiner Exact Duplicates Removed=71440
+                Combiner Output Lines=37587711
+                Mapper Output Lines=37659151
+                Reducer Exact Duplicates Removed=1
+                Reducer Output Lines=37564750
+                Reducer Temporal Duplicates Removed=22960
+        Shuffle Errors
+                BAD_ID=0
+                CONNECTION=0
+                IO_ERROR=0
+                WRONG_LENGTH=0
+                WRONG_MAP=0
+                WRONG_REDUCE=0
+        File Input Format Counters 
+                Bytes Read=21608895493
+        File Output Format Counters 
+                Bytes Written=5800920447
+
+PARTIE 2 :
+
+37M:
+
+25/12/30 17:17:59 INFO mapreduce.Job: Job job_1766507239954_0471 completed successfully
+25/12/30 17:17:59 INFO mapreduce.Job: Counters: 54
+        File System Counters
+                FILE: Number of bytes read=1037773807
+                FILE: Number of bytes written=2334942567
+                FILE: Number of read operations=0
+                FILE: Number of large read operations=0
+                FILE: Number of write operations=0
+                HDFS: Number of bytes read=5800925007
+                HDFS: Number of bytes written=2369974619
+                HDFS: Number of read operations=210
+                HDFS: Number of large read operations=0
+                HDFS: Number of write operations=20
+        Job Counters 
+                Launched map tasks=40
+                Launched reduce tasks=10
+                Data-local map tasks=31
+                Rack-local map tasks=9
+                Total time spent by all maps in occupied slots (ms)=5655978
+                Total time spent by all reduces in occupied slots (ms)=304322
+                Total time spent by all map tasks (ms)=942663
+                Total time spent by all reduce tasks (ms)=152161
+                Total vcore-milliseconds taken by all map tasks=942663
+                Total vcore-milliseconds taken by all reduce tasks=152161
+                Total megabyte-milliseconds taken by all map tasks=5791721472
+                Total megabyte-milliseconds taken by all reduce tasks=311625728
+        Map-Reduce Framework
+                Map input records=37564750
+                Map output records=70180914
+                Map output bytes=2667004111
+                Map output materialized bytes=1284824690
+                Input split bytes=4560
+                Combine input records=70180914
+                Combine output records=70180914
+                Reduce input groups=62359021
+                Reduce shuffle bytes=1284824690
+                Reduce input records=70180914
+                Reduce output records=62359021
+                Spilled Records=140361828
+                Shuffled Maps =400
+                Failed Shuffles=0
+                Merged Map outputs=400
+                GC time elapsed (ms)=180129
+                CPU time spent (ms)=1739920
+                Physical memory (bytes) snapshot=66612383744
+                Virtual memory (bytes) snapshot=259751428096
+                Total committed heap usage (bytes)=66204991488
+                Peak Map Physical memory (bytes)=1505329152
+                Peak Map Virtual memory (bytes)=5607464960
+                Peak Reduce Physical memory (bytes)=789815296
+                Peak Reduce Virtual memory (bytes)=3834662912
+        Shuffle Errors
+                BAD_ID=0
+                CONNECTION=0
+                IO_ERROR=0
+                WRONG_LENGTH=0
+                WRONG_MAP=0
+                WRONG_REDUCE=0
+        File Input Format Counters 
+                Bytes Read=5800920447
+        File Output Format Counters 
+                Bytes Written=2369974619
+Edges job completed in 55.93 seconds
+
+=== All Jobs Completed Successfully ===
+Nodes job: 120.66 sec
+Edges job: 55.93 sec
+Total time: 176.60 sec
