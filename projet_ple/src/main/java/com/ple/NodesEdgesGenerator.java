@@ -1,19 +1,21 @@
 package com.ple;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
+import java.io.DataInput;
+import java.io.DataOutput;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableComparator;
+import org.apache.hadoop.mapreduce.Counter;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
@@ -24,777 +26,963 @@ import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
 /**
- * MapReduce job to generate nodes and edges from cleaned game data.
+ * ULTRA-OPTIMIZED MapReduce for nodes and edges generation.
  *
- * Nodes: All unique decks AND archetypes (sub-decks of 1-7 cards) with their occurrence count and win count.
- * Edges: All deck matchups with match count and win count (directional).
+ * ARCHITECTURE: 2 SEPARATE JOBS
+ * - Job 1 (Nodes): Key=archetype, aggregates (count, wins)
+ * - Job 2 (Edges): Key=(source,target), aggregates (count, wins)
  *
- * This job runs two sequential MapReduce jobs:
- * 1. NodesJob: Generates deck and archetype statistics (archetype;count;wins)
- * 2. EdgesJob: Generates matchup statistics (source;target;count;wins)
+ * CRITICAL OPTIMIZATIONS:
+ * 1. NO Gson: Manual JSON parsing via GameWritable
+ * 2. ALL C(8,k) combinations generated (subject requirement)
+ * 3. STREAMING generation: No array allocation
+ * 4. FIXED countingSort bug: Separate buffers
+ * 5. LongWritable keys: Binary encoding
+ * 6. SEPARATE JOBS: Proper reduction for nodes AND edges
+ * 7. COMBINER: For nodes AND edges (massive network reduction)
+ * 8. COMPRESSION: Snappy on map output
+ * 9. ANTI-EXPLOSION: Warning for k<=5
+ * 10. Non-recursive loops: Unrolled for k=1..8
+ * 11. EdgeKey: Composite key for proper edge reduction
+ *
+ * OUTPUT:
+ * - <output>/nodes/part-r-* : archetype;count;wins
+ * - <output>/edges/part-r-* : source;target;count;wins
  */
 public class NodesEdgesGenerator extends Configured implements Tool {
 
-  // ==================== NODES JOB ====================
+  // ==================== COUNTERS ====================
+
+  public static enum NodesMetrics {
+    GAMES_PROCESSED,
+    GAMES_SKIPPED,
+    NODES_EMITTED,
+  }
+
+  public static enum EdgesMetrics {
+    GAMES_PROCESSED,
+    GAMES_SKIPPED,
+    EDGES_EMITTED,
+  }
+
+  // ==================== EDGE COMPOSITE KEY ====================
 
   /**
-   * Mapper for nodes generation with IN-MAPPER COMBINING optimization.
-   * OPTIMIZATION: Local aggregation dramatically reduces network traffic from ~51M to ~few M emissions.
-   *
-   * Reads SequenceFile input (NullWritable, Text) from DataCleaner output.
-   * Emits:
-   * - Full deck (8 cards)
-   * - All archetypes (sub-decks of configurable size range)
-   * Format: (archetype, "count,wins") aggregated locally per split
+   * Composite key for edges: (source, target).
+   * Enables proper reduction by (source,target) pair.
    */
+  public static class EdgeKey implements WritableComparable<EdgeKey> {
+
+    private long source;
+    private long target;
+
+    public EdgeKey() {}
+
+    public void set(long source, long target) {
+      this.source = source;
+      this.target = target;
+    }
+
+    public long getSource() {
+      return source;
+    }
+
+    public long getTarget() {
+      return target;
+    }
+
+    @Override
+    public void write(DataOutput out) throws IOException {
+      out.writeLong(source);
+      out.writeLong(target);
+    }
+
+    @Override
+    public void readFields(DataInput in) throws IOException {
+      source = in.readLong();
+      target = in.readLong();
+    }
+
+    @Override
+    public int compareTo(EdgeKey o) {
+      int cmp = Long.compare(source, o.source);
+      return cmp != 0 ? cmp : Long.compare(target, o.target);
+    }
+
+    @Override
+    public int hashCode() {
+      return (int) ((source * 31) ^ target);
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (obj instanceof EdgeKey) {
+        EdgeKey o = (EdgeKey) obj;
+        return source == o.source && target == o.target;
+      }
+      return false;
+    }
+  }
+
+  /** Raw comparator for EdgeKey - avoids deserialization */
+  public static class EdgeKeyComparator extends WritableComparator {
+
+    public EdgeKeyComparator() {
+      super(EdgeKey.class, true);
+    }
+
+    @Override
+    public int compare(byte[] b1, int s1, int l1, byte[] b2, int s2, int l2) {
+      long src1 = readLong(b1, s1);
+      long src2 = readLong(b2, s2);
+      int cmp = Long.compare(src1, src2);
+      if (cmp != 0) return cmp;
+      long tgt1 = readLong(b1, s1 + 8);
+      long tgt2 = readLong(b2, s2 + 8);
+      return Long.compare(tgt1, tgt2);
+    }
+  }
+
+  // ==================== IN-MAPPER COMBINING CONSTANTS ====================
+
+  /** Max entries in local aggregation map before flush (tune based on heap) */
+  private static final int MAX_MAP_SIZE = 500_000;
+
+  /** Flush threshold as percentage of max */
+  private static final float FLUSH_THRESHOLD = 0.9f;
+
+  // ==================== JOB 1: NODES ====================
+
   public static class NodesMapper
-    extends Mapper<NullWritable, Text, Text, Text> {
+    extends Mapper<NullWritable, Text, LongWritable, LongWritable> {
 
-    private final Gson gson = new Gson();
-    private final Text outputKey = new Text();
-    private final Text outputValue = new Text();
+    private final GameWritable game = new GameWritable();
+    private final LongWritable outKey = new LongWritable();
+    private final LongWritable outVal = new LongWritable();
+    private int k;
+    private final byte[] buf0 = new byte[8], buf1 = new byte[8];
+    private final int[] cnt = new int[256];
+    private Counter processed, skipped, emitted;
 
-    // OPTIMIZATION: In-mapper combining - local aggregation before emission
-    // Reduces emissions from 51M to ~few million (10-20x reduction)
-    private Map<String, long[]> localAggregation;
+    // IN-MAPPER COMBINING: Local aggregation map
+    // Key: archetype (long), Value: packed (count << 32 | wins)
+    private HashMap<Long, long[]> localMap;
+    private long localEmitCount;
+    private Context context;
 
-    // CONFIGURATION: Archetype size range (configurable via CLI)
-    private int minArchetypeSize;
-    private int maxArchetypeSize;
-    private boolean generateFullDeck;
-
-    /**
-     * Setup method to initialize local aggregation and read configuration.
-     * OPTIMIZATION: Pre-allocate HashMap with estimated capacity to reduce resizing.
-     */
     @Override
-    protected void setup(Context context)
-      throws IOException, InterruptedException {
-      super.setup(context);
-
-      // OPTIMIZATION: Pre-allocate with estimated capacity (avg ~1000 unique archetypes per split)
-      localAggregation = new HashMap<>(2000, 0.75f);
-
-      // READ CONFIGURATION: Archetype size range from job configuration
-      Configuration conf = context.getConfiguration();
-      minArchetypeSize = conf.getInt("archetype.min.size", 1);
-      maxArchetypeSize = conf.getInt("archetype.max.size", 7);
-      generateFullDeck = conf.getBoolean("archetype.include.full.deck", true);
-
-      System.out.println(
-        "NodesMapper configured: archetypes size [" +
-        minArchetypeSize +
-        "-" +
-        maxArchetypeSize +
-        "], full deck: " +
-        generateFullDeck
-      );
+    protected void setup(Context ctx) {
+      k = ctx.getConfiguration().getInt("archetype.size", 7);
+      processed = ctx.getCounter(NodesMetrics.GAMES_PROCESSED);
+      skipped = ctx.getCounter(NodesMetrics.GAMES_SKIPPED);
+      emitted = ctx.getCounter(NodesMetrics.NODES_EMITTED);
+      // Initialize local map with expected capacity
+      localMap = new HashMap<>(MAX_MAP_SIZE / 2);
+      localEmitCount = 0;
+      context = ctx;
     }
 
-    /**
-     * Map function that processes each game line.
-     * OPTIMIZATION: Aggregates locally instead of emitting for each archetype.
-     *
-     * @param key     NullWritable from SequenceFile
-     * @param value   JSON game data line
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
     @Override
-    protected void map(NullWritable key, Text value, Context context)
+    protected void map(NullWritable key, Text val, Context ctx)
       throws IOException, InterruptedException {
-      String line = value.toString().trim();
-
-      // Parse JSON
-      JsonObject game;
-      try {
-        game = gson.fromJson(line, JsonObject.class);
-        if (game == null) {
-          return;
-        }
-      } catch (Exception e) {
-        return; // Skip invalid JSON
-      }
-
-      // Extract players array and winner
-      JsonArray players;
-      int winner;
-      try {
-        players = game.getAsJsonArray("players");
-        winner = game.get("winner").getAsInt();
-        if (players == null || players.size() != 2) {
-          return;
-        }
-      } catch (Exception e) {
-        return; // Skip if players array is invalid
-      }
-
-      // Process both players
-      for (int i = 0; i < 2; i++) {
-        try {
-          JsonObject player = players.get(i).getAsJsonObject();
-          String deck = player.get("deck").getAsString();
-          boolean win = (i == winner);
-
-          // Generate all archetypes (sub-decks) for this deck
-          List<String> archetypes = generateArchetypes(deck);
-
-          // OPTIMIZATION: Aggregate locally instead of immediate emission
-          for (String archetype : archetypes) {
-            long[] stats = localAggregation.get(archetype);
-            if (stats == null) {
-              stats = new long[2]; // [count, wins]
-              localAggregation.put(archetype, stats);
-            }
-            stats[0]++; // Increment count
-            if (win) {
-              stats[1]++; // Increment wins if player won
-            }
-          }
-        } catch (Exception e) {
-          continue; // Skip this player if parsing fails
-        }
-      }
-    }
-
-    /**
-     * Cleanup method to emit aggregated results.
-     * OPTIMIZATION: Emit once per unique archetype instead of once per occurrence.
-     * This reduces emissions from ~51M to ~few million (massive network traffic reduction).
-     */
-    @Override
-    protected void cleanup(Context context)
-      throws IOException, InterruptedException {
-      // Emit all locally aggregated statistics
-      for (Map.Entry<String, long[]> entry : localAggregation.entrySet()) {
-        outputKey.set(entry.getKey());
-        long[] stats = entry.getValue();
-        outputValue.set(stats[0] + "," + stats[1]); // count,wins
-        context.write(outputKey, outputValue);
-      }
-
-      // Clear map to free memory
-      localAggregation.clear();
-
-      super.cleanup(context);
-    }
-
-    /**
-     * Generates archetypes (sub-decks) from a full deck with configurable size range.
-     * CONFIGURATION: Size range controlled by minArchetypeSize and maxArchetypeSize.
-     * OPTIMIZATION: Allows reducing archetype generation (e.g., only 3-6 cards for performance).
-     * Cards are kept in sorted order to normalize archetypes.
-     *
-     * @param deck The full deck as a 16-character hex string (8 cards × 2 chars)
-     * @return List of all archetype strings within configured size range
-     */
-    private List<String> generateArchetypes(String deck) {
-      List<String> archetypes = new ArrayList<>();
-
-      // Parse deck into individual cards (2 hex chars each)
-      List<String> cards = new ArrayList<>();
-      for (int i = 0; i < deck.length(); i += 2) {
-        cards.add(deck.substring(i, i + 2));
-      }
-
-      // Sort cards to normalize archetypes
-      Collections.sort(cards);
-
-      // CONFIGURATION: Generate combinations within specified size range
-      for (
-        int size = minArchetypeSize;
-        size <= Math.min(maxArchetypeSize, cards.size() - 1);
-        size++
-      ) {
-        generateCombinations(cards, size, 0, new ArrayList<>(), archetypes);
-      }
-
-      // CONFIGURATION: Optionally add the full deck (8 cards)
-      if (generateFullDeck) {
-        archetypes.add(String.join("", cards));
-      }
-
-      return archetypes;
-    }
-
-    /**
-     * Recursive helper to generate all combinations of a given size.
-     *
-     * @param cards       List of all cards
-     * @param size        Target combination size
-     * @param start       Current starting index
-     * @param current     Current combination being built
-     * @param archetypes  Output list to collect archetypes
-     */
-    private void generateCombinations(
-      List<String> cards,
-      int size,
-      int start,
-      List<String> current,
-      List<String> archetypes
-    ) {
-      if (current.size() == size) {
-        archetypes.add(String.join("", current));
+      if (!game.parseFromJson(val.toString())) {
+        skipped.increment(1);
         return;
       }
+      processed.increment(1);
+      byte[] s0 = sort(game.deck0, buf0), s1 = sort(game.deck1, buf1);
+      emitNodes(s0, game.winner == 0 ? 1 : 0);
+      emitNodes(s1, game.winner == 1 ? 1 : 0);
 
-      for (int i = start; i < cards.size(); i++) {
-        current.add(cards.get(i));
-        generateCombinations(cards, size, i + 1, current, archetypes);
-        current.remove(current.size() - 1);
+      // Flush if map is getting too large
+      if (localMap.size() >= MAX_MAP_SIZE * FLUSH_THRESHOLD) {
+        flush(ctx);
       }
     }
-  }
 
-  /**
-   * Combiner for nodes generation (local aggregation).
-   * Sums count and wins for each deck locally before sending to reducer.
-   */
-  public static class NodesCombiner extends Reducer<Text, Text, Text, Text> {
-
-    private final Text outputValue = new Text();
-
-    /**
-     * Reduce function that aggregates local statistics.
-     *
-     * @param key     Deck identifier
-     * @param values  Iterator of "count,wins" strings
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
     @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
+    protected void cleanup(Context ctx)
       throws IOException, InterruptedException {
-      long totalCount = 0;
-      long totalWins = 0;
+      flush(ctx);
+      emitted.increment(localEmitCount);
+    }
 
-      // Sum all count and wins values
-      for (Text value : values) {
-        String[] parts = value.toString().split(",");
-        if (parts.length == 2) {
-          totalCount += Long.parseLong(parts[0]);
-          totalWins += Long.parseLong(parts[1]);
-        }
+    /** Flush local map to context */
+    private void flush(Context ctx) throws IOException, InterruptedException {
+      for (Map.Entry<Long, long[]> e : localMap.entrySet()) {
+        outKey.set(e.getKey());
+        long[] v = e.getValue();
+        outVal.set((v[0] << 32) | v[1]);
+        ctx.write(outKey, outVal);
+        localEmitCount++;
       }
+      localMap.clear();
+    }
 
-      outputValue.set(totalCount + "," + totalWins);
-      context.write(key, outputValue);
+    private byte[] sort(byte[] d, byte[] o) {
+      Arrays.fill(cnt, 0);
+      for (int i = 0; i < 8; i++) cnt[d[i] & 0xFF]++;
+      int idx = 0;
+      for (int v = 0; v < 256; v++) while (cnt[v]-- > 0) o[idx++] = (byte) v;
+      return o;
+    }
+
+    /** Aggregate locally instead of emitting immediately */
+    private void emit(long arch, int w) {
+      long[] agg = localMap.get(arch);
+      if (agg == null) {
+        agg = new long[2]; // [count, wins]
+        localMap.put(arch, agg);
+      }
+      agg[0]++;
+      agg[1] += w;
+    }
+
+    private void emitNodes(byte[] d, int w) {
+      switch (k) {
+        case 1:
+          for (int i = 0; i < 8; i++) emit(d[i] & 0xFFL, w);
+          break;
+        case 2:
+          for (int i = 0; i < 7; i++) for (int j = i + 1; j < 8; j++) emit(
+            ((long) (d[i] & 0xFF) << 8) | (d[j] & 0xFF),
+            w
+          );
+          break;
+        case 3:
+          for (int i = 0; i < 6; i++) for (int j = i + 1; j < 7; j++) for (
+            int k = j + 1;
+            k < 8;
+            k++
+          ) emit(
+            ((long) (d[i] & 0xFF) << 16) |
+            ((long) (d[j] & 0xFF) << 8) |
+            (d[k] & 0xFF),
+            w
+          );
+          break;
+        case 4:
+          for (int i = 0; i < 5; i++) for (int j = i + 1; j < 6; j++) for (
+            int k = j + 1;
+            k < 7;
+            k++
+          ) for (int l = k + 1; l < 8; l++) emit(
+            ((long) (d[i] & 0xFF) << 24) |
+            ((long) (d[j] & 0xFF) << 16) |
+            ((long) (d[k] & 0xFF) << 8) |
+            (d[l] & 0xFF),
+            w
+          );
+          break;
+        case 5:
+          for (int i = 0; i < 4; i++) for (int j = i + 1; j < 5; j++) for (
+            int k = j + 1;
+            k < 6;
+            k++
+          ) for (int l = k + 1; l < 7; l++) for (
+            int m = l + 1;
+            m < 8;
+            m++
+          ) emit(
+            ((long) (d[i] & 0xFF) << 32) |
+            ((long) (d[j] & 0xFF) << 24) |
+            ((long) (d[k] & 0xFF) << 16) |
+            ((long) (d[l] & 0xFF) << 8) |
+            (d[m] & 0xFF),
+            w
+          );
+          break;
+        case 6:
+          for (int i = 0; i < 3; i++) for (int j = i + 1; j < 4; j++) for (
+            int k = j + 1;
+            k < 5;
+            k++
+          ) for (int l = k + 1; l < 6; l++) for (
+            int m = l + 1;
+            m < 7;
+            m++
+          ) for (int n = m + 1; n < 8; n++) emit(
+            ((long) (d[i] & 0xFF) << 40) |
+            ((long) (d[j] & 0xFF) << 32) |
+            ((long) (d[k] & 0xFF) << 24) |
+            ((long) (d[l] & 0xFF) << 16) |
+            ((long) (d[m] & 0xFF) << 8) |
+            (d[n] & 0xFF),
+            w
+          );
+          break;
+        case 7:
+          for (int i = 0; i < 2; i++) for (int j = i + 1; j < 3; j++) for (
+            int k = j + 1;
+            k < 4;
+            k++
+          ) for (int l = k + 1; l < 5; l++) for (
+            int m = l + 1;
+            m < 6;
+            m++
+          ) for (int n = m + 1; n < 7; n++) for (
+            int o = n + 1;
+            o < 8;
+            o++
+          ) emit(
+            ((long) (d[i] & 0xFF) << 48) |
+            ((long) (d[j] & 0xFF) << 40) |
+            ((long) (d[k] & 0xFF) << 32) |
+            ((long) (d[l] & 0xFF) << 24) |
+            ((long) (d[m] & 0xFF) << 16) |
+            ((long) (d[n] & 0xFF) << 8) |
+            (d[o] & 0xFF),
+            w
+          );
+          break;
+        case 8:
+          emit(
+            ((long) (d[0] & 0xFF) << 56) |
+            ((long) (d[1] & 0xFF) << 48) |
+            ((long) (d[2] & 0xFF) << 40) |
+            ((long) (d[3] & 0xFF) << 32) |
+            ((long) (d[4] & 0xFF) << 24) |
+            ((long) (d[5] & 0xFF) << 16) |
+            ((long) (d[6] & 0xFF) << 8) |
+            (d[7] & 0xFF),
+            w
+          );
+          break;
+      }
     }
   }
 
-  /**
-   * Reducer for nodes generation (global aggregation).
-   * Outputs final deck statistics in CSV format: deck;count;wins
-   */
-  public static class NodesReducer extends Reducer<Text, Text, Text, Text> {
+  /** Combiner for nodes - aggregates locally before shuffle */
+  public static class NodesCombiner
+    extends Reducer<LongWritable, LongWritable, LongWritable, LongWritable> {
 
-    private final Text outputValue = new Text();
+    private final LongWritable out = new LongWritable();
 
-    /**
-     * Reduce function that outputs final statistics.
-     *
-     * @param key     Deck identifier
-     * @param values  Iterator of "count,wins" strings
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
     @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
-      throws IOException, InterruptedException {
-      long totalCount = 0;
-      long totalWins = 0;
-
-      // Sum all count and wins values
-      for (Text value : values) {
-        String[] parts = value.toString().split(",");
-        if (parts.length == 2) {
-          totalCount += Long.parseLong(parts[0]);
-          totalWins += Long.parseLong(parts[1]);
-        }
+    protected void reduce(
+      LongWritable key,
+      Iterable<LongWritable> vals,
+      Context ctx
+    ) throws IOException, InterruptedException {
+      long count = 0, wins = 0;
+      for (LongWritable v : vals) {
+        long p = v.get();
+        count += (p >> 32) & 0xFFFFFFFFL;
+        wins += p & 0xFFFFFFFFL;
       }
-
-      // Output format: deck;count;wins
-      outputValue.set(key.toString() + ";" + totalCount + ";" + totalWins);
-      context.write(null, outputValue);
+      out.set((count << 32) | wins);
+      ctx.write(key, out);
     }
   }
 
-  // ==================== EDGES JOB ====================
+  public static class NodesReducer
+    extends Reducer<LongWritable, LongWritable, NullWritable, Text> {
 
-  /**
-   * Mapper for edges generation with IN-MAPPER COMBINING optimization.
-   * OPTIMIZATION: Local aggregation reduces emissions and network traffic.
-   *
-   * Reads SequenceFile input (NullWritable, Text) from DataCleaner output.
-   * Emits (source|target, "count,wins") aggregated locally per split.
-   * Each match generates two edges (one from each player's perspective).
-   */
+    private final Text out = new Text();
+    private int k;
+
+    @Override
+    protected void setup(Context ctx) {
+      k = ctx.getConfiguration().getInt("archetype.size", 7);
+    }
+
+    @Override
+    protected void reduce(
+      LongWritable key,
+      Iterable<LongWritable> vals,
+      Context ctx
+    ) throws IOException, InterruptedException {
+      long count = 0, wins = 0;
+      for (LongWritable v : vals) {
+        long p = v.get();
+        count += (p >> 32) & 0xFFFFFFFFL;
+        wins += p & 0xFFFFFFFFL;
+      }
+      out.set(hex(key.get(), k) + ";" + count + ";" + wins);
+      ctx.write(NullWritable.get(), out);
+    }
+
+    private String hex(long v, int n) {
+      StringBuilder sb = new StringBuilder(n * 2);
+      for (int i = n - 1; i >= 0; i--) {
+        int b = (int) ((v >> (i * 8)) & 0xFF);
+        sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+        sb.append(Character.forDigit(b & 0xF, 16));
+      }
+      return sb.toString();
+    }
+  }
+
+  // ==================== JOB 2: EDGES ====================
+
   public static class EdgesMapper
-    extends Mapper<NullWritable, Text, Text, Text> {
+    extends Mapper<NullWritable, Text, EdgeKey, LongWritable> {
 
-    private final Gson gson = new Gson();
-    private final Text outputKey = new Text();
-    private final Text outputValue = new Text();
+    private final GameWritable game = new GameWritable();
+    private final EdgeKey outKey = new EdgeKey();
+    private final LongWritable outVal = new LongWritable();
+    private int k;
+    private final byte[] buf0 = new byte[8], buf1 = new byte[8];
+    private final int[] cnt = new int[256];
+    private Counter processed, skipped, emitted;
 
-    // OPTIMIZATION: In-mapper combining - local aggregation for edges
-    private Map<String, long[]> localAggregation;
+    // IN-MAPPER COMBINING: Local aggregation map for edges
+    // Key: packed (source << 64 bits conceptually, but we use 2 longs)
+    // Using a custom key class would be expensive, so we use a long-pair encoding
+    private HashMap<Long, HashMap<Long, long[]>> localEdgeMap;
+    private long localEmitCount;
+    private int localMapEntries;
 
-    /**
-     * Setup method to initialize local aggregation.
-     * OPTIMIZATION: Pre-allocate HashMap to reduce resizing overhead.
-     */
     @Override
-    protected void setup(Context context)
-      throws IOException, InterruptedException {
-      super.setup(context);
-      // OPTIMIZATION: Pre-allocate with estimated capacity
-      localAggregation = new HashMap<>(5000, 0.75f);
+    protected void setup(Context ctx) {
+      k = ctx.getConfiguration().getInt("archetype.size", 7);
+      processed = ctx.getCounter(EdgesMetrics.GAMES_PROCESSED);
+      skipped = ctx.getCounter(EdgesMetrics.GAMES_SKIPPED);
+      emitted = ctx.getCounter(EdgesMetrics.EDGES_EMITTED);
+      // Nested map: source -> (target -> [count, wins])
+      localEdgeMap = new HashMap<>(16384);
+      localEmitCount = 0;
+      localMapEntries = 0;
     }
 
-    /**
-     * Map function that processes each game line.
-     * OPTIMIZATION: Aggregates locally instead of immediate emission.
-     *
-     * @param key     NullWritable from SequenceFile
-     * @param value   JSON game data line
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
     @Override
-    protected void map(NullWritable key, Text value, Context context)
+    protected void map(NullWritable key, Text val, Context ctx)
       throws IOException, InterruptedException {
-      String line = value.toString().trim();
-
-      // Parse JSON
-      JsonObject game;
-      try {
-        game = gson.fromJson(line, JsonObject.class);
-        if (game == null) {
-          return;
-        }
-      } catch (Exception e) {
-        return; // Skip invalid JSON
+      if (!game.parseFromJson(val.toString())) {
+        skipped.increment(1);
+        return;
       }
+      processed.increment(1);
+      byte[] s0 = sort(game.deck0, buf0), s1 = sort(game.deck1, buf1);
+      emitEdges(s0, s1, game.winner);
 
-      // Extract players array and winner
-      JsonArray players;
-      int winner;
-      try {
-        players = game.getAsJsonArray("players");
-        winner = game.get("winner").getAsInt();
-        if (players == null || players.size() != 2) {
-          return;
-        }
-      } catch (Exception e) {
-        return; // Skip if players array is invalid
-      }
-
-      // Extract both players' data
-      try {
-        JsonObject player0 = players.get(0).getAsJsonObject();
-        JsonObject player1 = players.get(1).getAsJsonObject();
-
-        String deck0 = player0.get("deck").getAsString();
-        String deck1 = player1.get("deck").getAsString();
-        boolean win0 = (winner == 0);
-        boolean win1 = (winner == 1);
-
-        // OPTIMIZATION: Aggregate edge from player0's perspective locally
-        String edge0 = deck0 + "|" + deck1;
-        long[] stats0 = localAggregation.get(edge0);
-        if (stats0 == null) {
-          stats0 = new long[2]; // [count, wins]
-          localAggregation.put(edge0, stats0);
-        }
-        stats0[0]++; // Increment count
-        if (win0) {
-          stats0[1]++; // Increment wins
-        }
-
-        // OPTIMIZATION: Aggregate edge from player1's perspective locally
-        String edge1 = deck1 + "|" + deck0;
-        long[] stats1 = localAggregation.get(edge1);
-        if (stats1 == null) {
-          stats1 = new long[2]; // [count, wins]
-          localAggregation.put(edge1, stats1);
-        }
-        stats1[0]++; // Increment count
-        if (win1) {
-          stats1[1]++; // Increment wins
-        }
-      } catch (Exception e) {
-        return; // Skip if player data is invalid
+      // Flush if map is getting too large
+      if (localMapEntries >= MAX_MAP_SIZE * FLUSH_THRESHOLD) {
+        flush(ctx);
       }
     }
 
-    /**
-     * Cleanup method to emit aggregated edge results.
-     * OPTIMIZATION: Emit once per unique edge instead of once per match.
-     */
     @Override
-    protected void cleanup(Context context)
+    protected void cleanup(Context ctx)
       throws IOException, InterruptedException {
-      // Emit all locally aggregated edge statistics
-      for (Map.Entry<String, long[]> entry : localAggregation.entrySet()) {
-        outputKey.set(entry.getKey());
-        long[] stats = entry.getValue();
-        outputValue.set(stats[0] + "," + stats[1]); // count,wins
-        context.write(outputKey, outputValue);
-      }
-
-      // Clear map to free memory
-      localAggregation.clear();
-
-      super.cleanup(context);
+      flush(ctx);
+      emitted.increment(localEmitCount);
     }
-  }
 
-  /**
-   * Combiner for edges generation (local aggregation).
-   * Sums count and wins for each matchup locally before sending to reducer.
-   */
-  public static class EdgesCombiner extends Reducer<Text, Text, Text, Text> {
-
-    private final Text outputValue = new Text();
-
-    /**
-     * Reduce function that aggregates local statistics.
-     *
-     * @param key     Edge identifier (source|target)
-     * @param values  Iterator of "count,wins" strings
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
-    @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
-      throws IOException, InterruptedException {
-      long totalCount = 0;
-      long totalWins = 0;
-
-      // Sum all count and wins values
-      for (Text value : values) {
-        String[] parts = value.toString().split(",");
-        if (parts.length == 2) {
-          totalCount += Long.parseLong(parts[0]);
-          totalWins += Long.parseLong(parts[1]);
+    /** Flush local edge map to context */
+    private void flush(Context ctx) throws IOException, InterruptedException {
+      for (Map.Entry<Long, HashMap<Long, long[]>> srcEntry : localEdgeMap.entrySet()) {
+        long src = srcEntry.getKey();
+        for (Map.Entry<Long, long[]> tgtEntry : srcEntry
+          .getValue()
+          .entrySet()) {
+          long tgt = tgtEntry.getKey();
+          long[] v = tgtEntry.getValue();
+          outKey.set(src, tgt);
+          outVal.set((v[0] << 32) | v[1]);
+          ctx.write(outKey, outVal);
+          localEmitCount++;
         }
       }
-
-      outputValue.set(totalCount + "," + totalWins);
-      context.write(key, outputValue);
+      localEdgeMap.clear();
+      localMapEntries = 0;
     }
-  }
 
-  /**
-   * Reducer for edges generation (global aggregation).
-   * Outputs final matchup statistics in CSV format: source;target;count;wins
-   */
-  public static class EdgesReducer extends Reducer<Text, Text, Text, Text> {
+    private byte[] sort(byte[] d, byte[] o) {
+      Arrays.fill(cnt, 0);
+      for (int i = 0; i < 8; i++) cnt[d[i] & 0xFF]++;
+      int idx = 0;
+      for (int v = 0; v < 256; v++) while (cnt[v]-- > 0) o[idx++] = (byte) v;
+      return o;
+    }
 
-    private final Text outputValue = new Text();
-
-    /**
-     * Reduce function that outputs final statistics.
-     *
-     * @param key     Edge identifier (source|target)
-     * @param values  Iterator of "count,wins" strings
-     * @param context MapReduce context
-     * @throws IOException          on I/O errors
-     * @throws InterruptedException on thread interruption
-     */
-    @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
-      throws IOException, InterruptedException {
-      long totalCount = 0;
-      long totalWins = 0;
-
-      // Sum all count and wins values
-      for (Text value : values) {
-        String[] parts = value.toString().split(",");
-        if (parts.length == 2) {
-          totalCount += Long.parseLong(parts[0]);
-          totalWins += Long.parseLong(parts[1]);
-        }
+    /** Aggregate locally instead of emitting immediately */
+    private void emit(long src, long tgt, int w) {
+      HashMap<Long, long[]> tgtMap = localEdgeMap.get(src);
+      if (tgtMap == null) {
+        tgtMap = new HashMap<>(256);
+        localEdgeMap.put(src, tgtMap);
       }
-
-      // Parse key to extract source and target
-      String[] decks = key.toString().split("\\|");
-      if (decks.length != 2) {
-        return; // Skip invalid keys
+      long[] agg = tgtMap.get(tgt);
+      if (agg == null) {
+        agg = new long[2]; // [count, wins]
+        tgtMap.put(tgt, agg);
+        localMapEntries++;
       }
+      agg[0]++;
+      agg[1] += w;
+    }
 
-      // Output format: source;target;count;wins
-      outputValue.set(
-        decks[0] + ";" + decks[1] + ";" + totalCount + ";" + totalWins
+    // Archetype computation helpers
+    private long a1(byte[] d, int i) {
+      return d[i] & 0xFFL;
+    }
+
+    private long a2(byte[] d, int i, int j) {
+      return ((long) (d[i] & 0xFF) << 8) | (d[j] & 0xFF);
+    }
+
+    private long a3(byte[] d, int i, int j, int k) {
+      return (
+        ((long) (d[i] & 0xFF) << 16) |
+        ((long) (d[j] & 0xFF) << 8) |
+        (d[k] & 0xFF)
       );
-      context.write(null, outputValue);
+    }
+
+    private long a4(byte[] d, int i, int j, int k, int l) {
+      return (
+        ((long) (d[i] & 0xFF) << 24) |
+        ((long) (d[j] & 0xFF) << 16) |
+        ((long) (d[k] & 0xFF) << 8) |
+        (d[l] & 0xFF)
+      );
+    }
+
+    private long a5(byte[] d, int i, int j, int k, int l, int m) {
+      return (
+        ((long) (d[i] & 0xFF) << 32) |
+        ((long) (d[j] & 0xFF) << 24) |
+        ((long) (d[k] & 0xFF) << 16) |
+        ((long) (d[l] & 0xFF) << 8) |
+        (d[m] & 0xFF)
+      );
+    }
+
+    private long a6(byte[] d, int i, int j, int k, int l, int m, int n) {
+      return (
+        ((long) (d[i] & 0xFF) << 40) |
+        ((long) (d[j] & 0xFF) << 32) |
+        ((long) (d[k] & 0xFF) << 24) |
+        ((long) (d[l] & 0xFF) << 16) |
+        ((long) (d[m] & 0xFF) << 8) |
+        (d[n] & 0xFF)
+      );
+    }
+
+    private long a7(byte[] d, int i, int j, int k, int l, int m, int n, int o) {
+      return (
+        ((long) (d[i] & 0xFF) << 48) |
+        ((long) (d[j] & 0xFF) << 40) |
+        ((long) (d[k] & 0xFF) << 32) |
+        ((long) (d[l] & 0xFF) << 24) |
+        ((long) (d[m] & 0xFF) << 16) |
+        ((long) (d[n] & 0xFF) << 8) |
+        (d[o] & 0xFF)
+      );
+    }
+
+    private long a8(byte[] d) {
+      return (
+        ((long) (d[0] & 0xFF) << 56) |
+        ((long) (d[1] & 0xFF) << 48) |
+        ((long) (d[2] & 0xFF) << 40) |
+        ((long) (d[3] & 0xFF) << 32) |
+        ((long) (d[4] & 0xFF) << 24) |
+        ((long) (d[5] & 0xFF) << 16) |
+        ((long) (d[6] & 0xFF) << 8) |
+        (d[7] & 0xFF)
+      );
+    }
+
+    private void emitEdges(byte[] d0, byte[] d1, int w) {
+      int w0 = w == 0 ? 1 : 0, w1 = w == 1 ? 1 : 0;
+      switch (k) {
+        case 1:
+          for (int i = 0; i < 8; i++) {
+            long x = a1(d0, i);
+            for (int j = 0; j < 8; j++) {
+              long y = a1(d1, j);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 2:
+          for (int i = 0; i < 7; i++) for (int j = i + 1; j < 8; j++) {
+            long x = a2(d0, i, j);
+            for (int a = 0; a < 7; a++) for (int b = a + 1; b < 8; b++) {
+              long y = a2(d1, a, b);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 3:
+          for (int i = 0; i < 6; i++) for (int j = i + 1; j < 7; j++) for (
+            int k = j + 1;
+            k < 8;
+            k++
+          ) {
+            long x = a3(d0, i, j, k);
+            for (int a = 0; a < 6; a++) for (int b = a + 1; b < 7; b++) for (
+              int c = b + 1;
+              c < 8;
+              c++
+            ) {
+              long y = a3(d1, a, b, c);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 4:
+          for (int i = 0; i < 5; i++) for (int j = i + 1; j < 6; j++) for (
+            int k = j + 1;
+            k < 7;
+            k++
+          ) for (int l = k + 1; l < 8; l++) {
+            long x = a4(d0, i, j, k, l);
+            for (int a = 0; a < 5; a++) for (int b = a + 1; b < 6; b++) for (
+              int c = b + 1;
+              c < 7;
+              c++
+            ) for (int e = c + 1; e < 8; e++) {
+              long y = a4(d1, a, b, c, e);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 5:
+          for (int i = 0; i < 4; i++) for (int j = i + 1; j < 5; j++) for (
+            int k = j + 1;
+            k < 6;
+            k++
+          ) for (int l = k + 1; l < 7; l++) for (int m = l + 1; m < 8; m++) {
+            long x = a5(d0, i, j, k, l, m);
+            for (int a = 0; a < 4; a++) for (int b = a + 1; b < 5; b++) for (
+              int c = b + 1;
+              c < 6;
+              c++
+            ) for (int e = c + 1; e < 7; e++) for (int f = e + 1; f < 8; f++) {
+              long y = a5(d1, a, b, c, e, f);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 6:
+          for (int i = 0; i < 3; i++) for (int j = i + 1; j < 4; j++) for (
+            int k = j + 1;
+            k < 5;
+            k++
+          ) for (int l = k + 1; l < 6; l++) for (
+            int m = l + 1;
+            m < 7;
+            m++
+          ) for (int n = m + 1; n < 8; n++) {
+            long x = a6(d0, i, j, k, l, m, n);
+            for (int a = 0; a < 3; a++) for (int b = a + 1; b < 4; b++) for (
+              int c = b + 1;
+              c < 5;
+              c++
+            ) for (int e = c + 1; e < 6; e++) for (
+              int f = e + 1;
+              f < 7;
+              f++
+            ) for (int g = f + 1; g < 8; g++) {
+              long y = a6(d1, a, b, c, e, f, g);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 7:
+          for (int i = 0; i < 2; i++) for (int j = i + 1; j < 3; j++) for (
+            int k = j + 1;
+            k < 4;
+            k++
+          ) for (int l = k + 1; l < 5; l++) for (
+            int m = l + 1;
+            m < 6;
+            m++
+          ) for (int n = m + 1; n < 7; n++) for (int o = n + 1; o < 8; o++) {
+            long x = a7(d0, i, j, k, l, m, n, o);
+            for (int a = 0; a < 2; a++) for (int b = a + 1; b < 3; b++) for (
+              int c = b + 1;
+              c < 4;
+              c++
+            ) for (int e = c + 1; e < 5; e++) for (
+              int f = e + 1;
+              f < 6;
+              f++
+            ) for (int g = f + 1; g < 7; g++) for (int h = g + 1; h < 8; h++) {
+              long y = a7(d1, a, b, c, e, f, g, h);
+              emit(x, y, w0);
+              emit(y, x, w1);
+            }
+          }
+          break;
+        case 8:
+          {
+            long x = a8(d0), y = a8(d1);
+            emit(x, y, w0);
+            emit(y, x, w1);
+          }
+          break;
+      }
     }
   }
 
-  // ==================== MAIN DRIVER ====================
+  /** Combiner for edges - aggregates by (source,target) locally */
+  public static class EdgesCombiner
+    extends Reducer<EdgeKey, LongWritable, EdgeKey, LongWritable> {
 
-  /**
-   * Run method that executes both jobs sequentially.
-   * CONFIGURATION: Accepts archetype size range parameters for optimization.
-   *
-   * @param args Command-line arguments: [input] [nodesOutput] [edgesOutput] [numReducers] [minArchetype] [maxArchetype]
-   * @return 0 on success, 1 on failure
-   * @throws Exception on job execution errors
-   */
+    private final LongWritable out = new LongWritable();
+
+    @Override
+    protected void reduce(
+      EdgeKey key,
+      Iterable<LongWritable> vals,
+      Context ctx
+    ) throws IOException, InterruptedException {
+      long count = 0, wins = 0;
+      for (LongWritable v : vals) {
+        long p = v.get();
+        count += (p >> 32) & 0xFFFFFFFFL;
+        wins += p & 0xFFFFFFFFL;
+      }
+      out.set((count << 32) | wins);
+      ctx.write(key, out);
+    }
+  }
+
+  public static class EdgesReducer
+    extends Reducer<EdgeKey, LongWritable, NullWritable, Text> {
+
+    private final Text out = new Text();
+    private int k;
+
+    @Override
+    protected void setup(Context ctx) {
+      k = ctx.getConfiguration().getInt("archetype.size", 7);
+    }
+
+    @Override
+    protected void reduce(
+      EdgeKey key,
+      Iterable<LongWritable> vals,
+      Context ctx
+    ) throws IOException, InterruptedException {
+      long count = 0, wins = 0;
+      for (LongWritable v : vals) {
+        long p = v.get();
+        count += (p >> 32) & 0xFFFFFFFFL;
+        wins += p & 0xFFFFFFFFL;
+      }
+      out.set(
+        hex(key.getSource(), k) +
+        ";" +
+        hex(key.getTarget(), k) +
+        ";" +
+        count +
+        ";" +
+        wins
+      );
+      ctx.write(NullWritable.get(), out);
+    }
+
+    private String hex(long v, int n) {
+      StringBuilder sb = new StringBuilder(n * 2);
+      for (int i = n - 1; i >= 0; i--) {
+        int b = (int) ((v >> (i * 8)) & 0xFF);
+        sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+        sb.append(Character.forDigit(b & 0xF, 16));
+      }
+      return sb.toString();
+    }
+  }
+
+  // ==================== DRIVER ====================
+
   @Override
   public int run(String[] args) throws Exception {
-    if (args.length < 3 || args.length > 6) {
+    if (args.length < 3 || args.length > 4) {
       System.err.println(
-        "Usage: NodesEdgesGenerator <input> <nodesOutput> <edgesOutput> [numReducers] [minArchetype] [maxArchetype]"
+        "Usage: nodesedges <input> <output> <k> [numReducers]"
+      );
+      System.err.println("  input:        SequenceFile from DataCleaner");
+      System.err.println(
+        "  output:       Output directory (creates /nodes and /edges)"
       );
       System.err.println(
-        "  input:         Path to cleaned game data (SequenceFile)"
+        "  k:            Archetype size (1-8, recommended: 6-7)"
       );
-      System.err.println("  nodesOutput:   Path for nodes output");
-      System.err.println("  edgesOutput:   Path for edges output");
-      System.err.println(
-        "  numReducers:   Optional, number of reducers (default: 1, recommended: 10-20 for 100k+ records)"
-      );
-      System.err.println(
-        "  minArchetype:  Optional, minimum archetype size (default: 1, recommended: 3-4 for performance)"
-      );
-      System.err.println(
-        "  maxArchetype:  Optional, maximum archetype size (default: 7, max: 7)"
-      );
-      System.err.println("");
-      System.err.println("PERFORMANCE TIPS:");
-      System.err.println(
-        "  - For 100k records: use numReducers=10-20, minArchetype=3, maxArchetype=6"
-      );
-      System.err.println(
-        "  - For 1M records: use numReducers=50, minArchetype=4, maxArchetype=6"
-      );
-      System.err.println(
-        "  - Limiting archetype range reduces processing time by 50-80%"
-      );
+      System.err.println("  numReducers:  Optional (default: 10)");
+      System.err.println();
+      System.err.println("OPTIMIZATIONS:");
+      System.err.println("  ✓ 2 SEPARATE JOBS (proper reduction)");
+      System.err.println("  ✓ COMBINER for nodes AND edges");
+      System.err.println("  ✓ EdgeKey composite for proper edge aggregation");
+      System.err.println("  ✓ SNAPPY compression on map output");
+      System.err.println("  ✓ NO Gson (manual JSON parsing)");
       return 1;
     }
 
     Configuration conf = getConf();
+    int k = Integer.parseInt(args[2]);
+    int numReducers = args.length == 4 ? Integer.parseInt(args[3]) : 10;
 
-    // HDFS OPTIMIZATION: Configure for maximum performance
-    // Increase sort buffer to reduce disk spills during shuffle
-    conf.setInt("io.sort.mb", 512); // Default is 100MB, increase to 512MB
-    conf.setFloat("io.sort.spill.percent", 0.9f); // Default is 0.8, delay spilling
+    if (k < 1 || k > 8) {
+      System.err.println("Error: k must be 1-8");
+      return 1;
+    }
 
-    // HDFS OPTIMIZATION: Enable map output compression to reduce network traffic
+    conf.setInt("archetype.size", k);
     conf.setBoolean("mapreduce.map.output.compress", true);
     conf.set(
       "mapreduce.map.output.compress.codec",
       "org.apache.hadoop.io.compress.SnappyCodec"
     );
 
-    // HDFS OPTIMIZATION: Increase buffer sizes for better I/O performance
-    conf.setInt("io.file.buffer.size", 131072); // 128KB, default is 4KB
+    // CRITICAL: Increase map output buffer to avoid ArrayIndexOutOfBoundsException
+    // Default is 100MB, we need more for high-volume edge emission
+    conf.setInt("mapreduce.task.io.sort.mb", 512);
+    conf.setFloat("mapreduce.map.sort.spill.percent", 0.9f);
 
-    // HDFS OPTIMIZATION: Configure reduce task memory
-    conf.set("mapreduce.reduce.memory.mb", "2048"); // 2GB per reducer
-    conf.set("mapreduce.reduce.java.opts", "-Xmx1638m"); // 80% of reducer memory
+    int comb = binomial(8, k);
+    int edges = comb * comb * 2;
 
-    int numReducers = 1;
-    int minArchetypeSize = 1;
-    int maxArchetypeSize = 7;
-
-    // Parse optional numReducers parameter
-    if (args.length >= 4) {
-      try {
-        numReducers = Integer.parseInt(args[3]);
-        if (numReducers < 1) {
-          System.err.println("Error: numReducers must be >= 1");
-          return 1;
-        }
-      } catch (NumberFormatException e) {
-        System.err.println("Error: numReducers must be an integer");
-        return 1;
-      }
-    }
-
-    // CONFIGURATION: Parse optional minArchetype parameter
-    if (args.length >= 5) {
-      try {
-        minArchetypeSize = Integer.parseInt(args[4]);
-        if (minArchetypeSize < 1 || minArchetypeSize > 8) {
-          System.err.println("Error: minArchetype must be between 1 and 8");
-          return 1;
-        }
-      } catch (NumberFormatException e) {
-        System.err.println("Error: minArchetype must be an integer");
-        return 1;
-      }
-    }
-
-    // CONFIGURATION: Parse optional maxArchetype parameter
-    if (args.length >= 6) {
-      try {
-        maxArchetypeSize = Integer.parseInt(args[5]);
-        if (maxArchetypeSize < 1 || maxArchetypeSize > 7) {
-          System.err.println("Error: maxArchetype must be between 1 and 7");
-          return 1;
-        }
-        if (maxArchetypeSize < minArchetypeSize) {
-          System.err.println("Error: maxArchetype must be >= minArchetype");
-          return 1;
-        }
-      } catch (NumberFormatException e) {
-        System.err.println("Error: maxArchetype must be an integer");
-        return 1;
-      }
-    }
-
-    // CONFIGURATION: Set archetype parameters in configuration for mappers
-    conf.setInt("archetype.min.size", minArchetypeSize);
-    conf.setInt("archetype.max.size", maxArchetypeSize);
-    conf.setBoolean("archetype.include.full.deck", true);
-
-    long globalStartTime = System.currentTimeMillis();
-    System.out.println("=== Starting Nodes & Edges Generation ===");
-    System.out.println("CONFIGURATION:");
-    System.out.println("  Number of Reducers: " + numReducers);
     System.out.println(
-      "  Archetype Size Range: [" +
-      minArchetypeSize +
-      "-" +
-      maxArchetypeSize +
-      "]"
+      "╔════════════════════════════════════════════════════╗"
     );
-    System.out.println("  Include Full Deck: true");
-    System.out.println("HDFS OPTIMIZATIONS:");
-    System.out.println("  Map Output Compression: Snappy");
-    System.out.println("  Sort Buffer: 512 MB");
-    System.out.println("  File Buffer: 128 KB");
-    System.out.println("  In-Mapper Combining: Enabled");
-
-    // ========== JOB 1: NODES GENERATION ==========
-    System.out.println("\n--- Job 1/2: Generating Nodes ---");
-    long nodesStartTime = System.currentTimeMillis();
-
-    Job nodesJob = Job.getInstance(conf, "Nodes Generator");
-    nodesJob.setJarByClass(NodesEdgesGenerator.class);
-
-    // Input format: SequenceFile from DataCleaner
-    nodesJob.setInputFormatClass(SequenceFileInputFormat.class);
-
-    // Mapper configuration
-    nodesJob.setMapperClass(NodesMapper.class);
-    nodesJob.setMapOutputKeyClass(Text.class);
-    nodesJob.setMapOutputValueClass(Text.class);
-
-    // Combiner configuration
-    nodesJob.setCombinerClass(NodesCombiner.class);
-
-    // Reducer configuration
-    nodesJob.setReducerClass(NodesReducer.class);
-    nodesJob.setOutputKeyClass(Text.class);
-    nodesJob.setOutputValueClass(Text.class);
-    nodesJob.setNumReduceTasks(numReducers);
-
-    // Input/Output paths
-    Path nodesOutputPath = new Path(args[1]);
-    FileInputFormat.addInputPath(nodesJob, new Path(args[0]));
-    FileOutputFormat.setOutputPath(nodesJob, nodesOutputPath);
-
-    // Delete output directory if exists
-    org.apache.hadoop.fs.FileSystem fs = org.apache.hadoop.fs.FileSystem.get(
-      conf
+    System.out.println("║     NodesEdgesGenerator - 2 JOBS OPTIMIZED      ║");
+    System.out.println(
+      "╠════════════════════════════════════════════════════╣"
     );
-    if (fs.exists(nodesOutputPath)) {
-      fs.delete(nodesOutputPath, true);
-      System.out.println("Deleted existing nodes output: " + args[1]);
+    System.out.printf(
+      "║  k=%d, C(8,%d)=%d archetypes/deck                  ║%n",
+      k,
+      k,
+      comb
+    );
+    System.out.printf(
+      "║  Nodes/game: %d, Edges/game: %,d               ║%n",
+      comb * 2,
+      edges
+    );
+    System.out.printf(
+      "║  Reducers: %d                                       ║%n",
+      numReducers
+    );
+    if (k <= 5) {
+      System.out.println(
+        "╠════════════════════════════════════════════════════╣"
+      );
+      System.out.println(
+        "║  ⚠️  WARNING: k≤5 generates MASSIVE edge volume!   ║"
+      );
+      System.out.printf(
+        "║  For 37M games: ~%,d BILLION edges to shuffle! ║%n",
+        37L * edges / 1_000_000_000
+      );
+      System.out.println(
+        "║  Consider k=6 or k=7 for better performance.       ║"
+      );
     }
+    System.out.println(
+      "║  ✓ IN-MAPPER COMBINING (local aggregation)         ║"
+    );
+    System.out.println(
+      "╚════════════════════════════════════════════════════╝"
+    );
 
-    // Run nodes job
-    boolean nodesSuccess = nodesJob.waitForCompletion(true);
-    long nodesEndTime = System.currentTimeMillis();
-    long nodesDuration = nodesEndTime - nodesStartTime;
+    Path input = new Path(args[0]);
+    Path outBase = new Path(args[1]);
+    Path nodesOut = new Path(outBase, "nodes");
+    Path edgesOut = new Path(outBase, "edges");
+    FileSystem fs = FileSystem.get(conf);
 
-    if (!nodesSuccess) {
-      System.err.println("Nodes job failed!");
+    long t0 = System.currentTimeMillis();
+
+    // ===== JOB 1: NODES =====
+    System.out.println("\n━━━ JOB 1: NODES ━━━");
+    if (fs.exists(nodesOut)) fs.delete(nodesOut, true);
+
+    Job j1 = Job.getInstance(conf, "NodesEdges_NODES (k=" + k + ")");
+    j1.setJarByClass(NodesEdgesGenerator.class);
+    j1.setInputFormatClass(SequenceFileInputFormat.class);
+    FileInputFormat.addInputPath(j1, input);
+    j1.setMapperClass(NodesMapper.class);
+    j1.setMapOutputKeyClass(LongWritable.class);
+    j1.setMapOutputValueClass(LongWritable.class);
+    j1.setCombinerClass(NodesCombiner.class);
+    j1.setReducerClass(NodesReducer.class);
+    j1.setOutputKeyClass(NullWritable.class);
+    j1.setOutputValueClass(Text.class);
+    j1.setNumReduceTasks(numReducers);
+    FileOutputFormat.setOutputPath(j1, nodesOut);
+
+    long n0 = System.currentTimeMillis();
+    if (!j1.waitForCompletion(true)) {
+      System.err.println("NODES failed!");
       return 1;
     }
-
+    long n1 = System.currentTimeMillis();
     System.out.printf(
-      "Nodes job completed in %.2f seconds%n",
-      nodesDuration / 1000.0
+      "NODES: %.1fs, %d games, %d nodes emitted%n",
+      (n1 - n0) / 1000.0,
+      j1.getCounters().findCounter(NodesMetrics.GAMES_PROCESSED).getValue(),
+      j1.getCounters().findCounter(NodesMetrics.NODES_EMITTED).getValue()
     );
 
-    // ========== JOB 2: EDGES GENERATION ==========
-    System.out.println("\n--- Job 2/2: Generating Edges ---");
-    long edgesStartTime = System.currentTimeMillis();
+    // ===== JOB 2: EDGES =====
+    System.out.println("\n━━━ JOB 2: EDGES ━━━");
+    if (fs.exists(edgesOut)) fs.delete(edgesOut, true);
 
-    Job edgesJob = Job.getInstance(conf, "Edges Generator");
-    edgesJob.setJarByClass(NodesEdgesGenerator.class);
+    Job j2 = Job.getInstance(conf, "NodesEdges_EDGES (k=" + k + ")");
+    j2.setJarByClass(NodesEdgesGenerator.class);
+    j2.setInputFormatClass(SequenceFileInputFormat.class);
+    FileInputFormat.addInputPath(j2, input);
+    j2.setMapperClass(EdgesMapper.class);
+    j2.setMapOutputKeyClass(EdgeKey.class);
+    j2.setMapOutputValueClass(LongWritable.class);
+    j2.setCombinerClass(EdgesCombiner.class);
+    j2.setSortComparatorClass(EdgeKeyComparator.class);
+    j2.setReducerClass(EdgesReducer.class);
+    j2.setOutputKeyClass(NullWritable.class);
+    j2.setOutputValueClass(Text.class);
+    j2.setNumReduceTasks(numReducers);
+    FileOutputFormat.setOutputPath(j2, edgesOut);
 
-    // Input format: SequenceFile from DataCleaner
-    edgesJob.setInputFormatClass(SequenceFileInputFormat.class);
-
-    // Mapper configuration
-    edgesJob.setMapperClass(EdgesMapper.class);
-    edgesJob.setMapOutputKeyClass(Text.class);
-    edgesJob.setMapOutputValueClass(Text.class);
-
-    // Combiner configuration
-    edgesJob.setCombinerClass(EdgesCombiner.class);
-
-    // Reducer configuration
-    edgesJob.setReducerClass(EdgesReducer.class);
-    edgesJob.setOutputKeyClass(Text.class);
-    edgesJob.setOutputValueClass(Text.class);
-    edgesJob.setNumReduceTasks(numReducers);
-
-    // Input/Output paths
-    Path edgesOutputPath = new Path(args[2]);
-    FileInputFormat.addInputPath(edgesJob, new Path(args[0]));
-    FileOutputFormat.setOutputPath(edgesJob, edgesOutputPath);
-
-    // Delete output directory if exists
-    if (fs.exists(edgesOutputPath)) {
-      fs.delete(edgesOutputPath, true);
-      System.out.println("Deleted existing edges output: " + args[2]);
-    }
-
-    // Run edges job
-    boolean edgesSuccess = edgesJob.waitForCompletion(true);
-    long edgesEndTime = System.currentTimeMillis();
-    long edgesDuration = edgesEndTime - edgesStartTime;
-
-    if (!edgesSuccess) {
-      System.err.println("Edges job failed!");
+    long e0 = System.currentTimeMillis();
+    if (!j2.waitForCompletion(true)) {
+      System.err.println("EDGES failed!");
       return 1;
     }
-
+    long e1 = System.currentTimeMillis();
     System.out.printf(
-      "Edges job completed in %.2f seconds%n",
-      edgesDuration / 1000.0
+      "EDGES: %.1fs, %d games, %d edges emitted%n",
+      (e1 - e0) / 1000.0,
+      j2.getCounters().findCounter(EdgesMetrics.GAMES_PROCESSED).getValue(),
+      j2.getCounters().findCounter(EdgesMetrics.EDGES_EMITTED).getValue()
     );
 
-    // ========== SUMMARY ==========
-    long globalEndTime = System.currentTimeMillis();
-    long totalDuration = globalEndTime - globalStartTime;
-
-    System.out.println("\n=== All Jobs Completed Successfully ===");
-    System.out.printf("Nodes job: %.2f sec%n", nodesDuration / 1000.0);
-    System.out.printf("Edges job: %.2f sec%n", edgesDuration / 1000.0);
-    System.out.printf("Total time: %.2f sec%n", totalDuration / 1000.0);
-
+    long t1 = System.currentTimeMillis();
+    System.out.println(
+      "\n╔════════════════════════════════════════════════════╗"
+    );
+    System.out.printf(
+      "║  TOTAL TIME: %.1f seconds                          ║%n",
+      (t1 - t0) / 1000.0
+    );
+    System.out.println(
+      "║  Output: " + outBase + "/nodes, " + outBase + "/edges"
+    );
+    System.out.println(
+      "╚════════════════════════════════════════════════════╝"
+    );
     return 0;
   }
 
-  /**
-   * Main entry point for the application.
-   *
-   * @param args Command-line arguments
-   * @throws Exception on execution errors
-   */
+  private static int binomial(int n, int k) {
+    if (k > n - k) k = n - k;
+    int r = 1;
+    for (int i = 0; i < k; i++) r = r * (n - i) / (i + 1);
+    return r;
+  }
+
   public static void main(String[] args) throws Exception {
     System.exit(ToolRunner.run(new NodesEdgesGenerator(), args));
   }

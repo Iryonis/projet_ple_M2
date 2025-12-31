@@ -9,13 +9,13 @@ Utiliser la commande :
 Data cleaning :
 
 ```sh
-yarn jar projet_ple-1.jar clean /user/auber/data_ple/clash_royale/raw_data_100K.json test
+yarn jar projet_ple-1.jar clean /user/auber/data_ple/clash_royale/raw_data_100K.json test 2
 ```
 
 Nodesedges pour achétypes de taille 7:
 
 ```sh
-yarn jar projet_ple-1.jar nodesedges   full   nodes_full   edges_full   10   7   7
+yarn jar projet_ple-1.jar nodesedges full full_7 7 40
 ```
 
 # Authors
