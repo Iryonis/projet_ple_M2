@@ -14,6 +14,11 @@ public class App {
         NodesEdgesGenerator.class,
         "generate nodes and edges from cleaned data"
       );
+      pgd.addClass(
+        "stats",
+        Stats.class,
+        "generate statistics from nodes and edges data"
+      );
       exitCode = pgd.run(args);
     } catch (Throwable e1) {
       e1.printStackTrace();
