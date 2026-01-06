@@ -559,3 +559,58 @@ Edges job completed in 55.93 seconds
 Nodes job: 120.66 sec
 Edges job: 55.93 sec
 Total time: 176.60 sec
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+=== Job Completed ===
+Total execution time: 1 min 17 sec (77.38 sec)
+
+=== Performance Metrics ===
+
+Mapper:
+  Input:  21550.12 MB (21550119746 bytes)
+  Output: 22708.37 MB (22708365342 bytes)
+  Time:   383.59 seconds (383585 ms)
+
+Combiner:
+  Input:  22708.37 MB (22708365342 bytes)
+  Output: 22665.19 MB (22665192383 bytes)
+  Time:   22.99 seconds (22990 ms)
+  Reduction: 0.19%
+
+Reducer:
+  Input:  22665.19 MB (22665192383 bytes)
+  Output: 21401.13 MB (21401125345 bytes)
+  Time:   61.69 seconds (61688 ms)
+  Reduction: 5.58%
+
+=== Overall Statistics ===
+  Total input:  21550.12 MB
+  Total output: 21401.13 MB
+  Total reduction: 0.69%
+  Processing time: 468.26 seconds (Mapper: 383.59, Combiner: 22.99, Reducer: 61.69)
