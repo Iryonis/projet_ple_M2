@@ -68,17 +68,31 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     long t0 = System.currentTimeMillis();
 
     // ===== JOB 1: NODES =====
-    if (!runNodesJob(conf, k, numReducers, input, nodesOut, fs)) {
+    Job nodesJob = runNodesJob(conf, k, numReducers, input, nodesOut, fs);
+    if (nodesJob == null) {
       return 1;
     }
 
     // ===== JOB 2: EDGES =====
-    if (!runEdgesJob(conf, k, numReducers, input, edgesOut, fs)) {
+    Job edgesJob = runEdgesJob(conf, k, numReducers, input, edgesOut, fs);
+    if (edgesJob == null) {
       return 1;
     }
 
     long t1 = System.currentTimeMillis();
-    printSummary(t1 - t0, outBase);
+    
+    // Count final output records and games processed
+    long numNodes = nodesJob.getCounters()
+        .findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS")
+        .getValue();
+    long numEdges = edgesJob.getCounters()
+        .findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS")
+        .getValue();
+    long numGames = nodesJob.getCounters()
+        .findCounter(NodesEdgesMetrics.NodesMetrics.GAMES_PROCESSED)
+        .getValue();
+    
+    printSummary(t1 - t0, numGames, numNodes, numEdges, outBase);
     return 0;
   }
 
@@ -93,8 +107,8 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     conf.setFloat("mapreduce.map.sort.spill.percent", 0.9f);
   }
 
-  private boolean runNodesJob(Configuration conf, int k, int numReducers,
-                               Path input, Path output, FileSystem fs) throws Exception {
+  private Job runNodesJob(Configuration conf, int k, int numReducers,
+                          Path input, Path output, FileSystem fs) throws Exception {
     System.out.println("\n━━━ JOB 1: NODES ━━━");
     if (fs.exists(output)) {
       fs.delete(output, true);
@@ -123,7 +137,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
 
     if (!success) {
       System.err.println("NODES job failed!");
-      return false;
+      return null;
     }
 
     System.out.printf("NODES: %.1fs, %d games, %d nodes emitted%n",
@@ -131,11 +145,11 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         job.getCounters().findCounter(NodesEdgesMetrics.NodesMetrics.GAMES_PROCESSED).getValue(),
         job.getCounters().findCounter(NodesEdgesMetrics.NodesMetrics.NODES_EMITTED).getValue());
 
-    return true;
+    return job;
   }
 
-  private boolean runEdgesJob(Configuration conf, int k, int numReducers,
-                               Path input, Path output, FileSystem fs) throws Exception {
+  private Job runEdgesJob(Configuration conf, int k, int numReducers,
+                          Path input, Path output, FileSystem fs) throws Exception {
     System.out.println("\n━━━ JOB 2: EDGES ━━━");
     if (fs.exists(output)) {
       fs.delete(output, true);
@@ -165,7 +179,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
 
     if (!success) {
       System.err.println("EDGES job failed!");
-      return false;
+      return null;
     }
 
     System.out.printf("EDGES: %.1fs, %d games, %d edges emitted%n",
@@ -173,7 +187,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         job.getCounters().findCounter(NodesEdgesMetrics.EdgesMetrics.GAMES_PROCESSED).getValue(),
         job.getCounters().findCounter(NodesEdgesMetrics.EdgesMetrics.EDGES_EMITTED).getValue());
 
-    return true;
+    return job;
   }
 
   private void printUsage() {
@@ -214,9 +228,15 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.println("╚════════════════════════════════════════════════════╝");
   }
 
-  private void printSummary(long totalMs, Path outBase) {
+  private void printSummary(long totalMs, long numGames, long numNodes, long numEdges, Path outBase) {
     System.out.println("\n╔════════════════════════════════════════════════════╗");
-    System.out.printf("║  TOTAL TIME: %.1f seconds                          ║%n", totalMs / 1000.0);
+    System.out.println("║              GENERATION COMPLETE                   ║");
+    System.out.println("╠════════════════════════════════════════════════════╣");
+    System.out.printf("║  TOTAL TIME:       %.1f seconds                    ║%n", totalMs / 1000.0);
+    System.out.printf("║  GAMES PROCESSED:  %,d                             ║%n", numGames);
+    System.out.printf("║  NODES CREATED:    %,d                             ║%n", numNodes);
+    System.out.printf("║  EDGES CREATED:    %,d                             ║%n", numEdges);
+    System.out.println("╠════════════════════════════════════════════════════╣");
     System.out.println("║  Output: " + outBase + "/nodes, " + outBase + "/edges");
     System.out.println("╚════════════════════════════════════════════════════╝");
   }
