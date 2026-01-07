@@ -87,9 +87,23 @@ public class GameWritable implements Writable {
       }
 
       if (winnerIdx >= json.length()) return false;
+      
+      // Handle winner: 0, 1, or -1 (draw/cancelled)
       char winnerChar = json.charAt(winnerIdx);
-      if (winnerChar != '0' && winnerChar != '1') return false;
-      winner = (byte) (winnerChar - '0');
+      if (winnerChar == '-') {
+        // Negative winner (-1)
+        winnerIdx++;
+        if (winnerIdx >= json.length()) return false;
+        winnerChar = json.charAt(winnerIdx);
+        if (winnerChar != '1') return false;
+        winner = -1;
+      } else if (winnerChar == '0') {
+        winner = 0;
+      } else if (winnerChar == '1') {
+        winner = 1;
+      } else {
+        return false;
+      }
 
       return true;
     } catch (Exception e) {
