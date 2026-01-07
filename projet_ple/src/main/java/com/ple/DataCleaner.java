@@ -251,9 +251,8 @@ public class DataCleaner extends Configured implements Tool {
             Instant timestamp = Instant.parse(dateStr);
             games.add(new GameEntry(line, timestamp));
           } catch (Exception e) {
-            context.write(NullWritable.get(), value);
             context
-              .getCounter("DataCleaner", "Reducer Output Lines")
+              .getCounter("DataCleaner", "Reducer Invalid Lines Skipped")
               .increment(1);
           }
         } else {
