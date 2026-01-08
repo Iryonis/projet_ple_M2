@@ -166,55 +166,6 @@ public class DataCleaner extends Configured implements Tool {
   }
 
   /**
-   * Combiner that removes exact duplicates locally to reduce data sent to Reducer.
-   */
-  public static class CleanCombiner extends Reducer<Text, Text, Text, Text> {
-
-    private final Set<String> seenLines = new HashSet<>();
-
-    @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
-      throws IOException, InterruptedException {
-      long startTime = System.nanoTime();
-      // Clear the set for each key
-      seenLines.clear();
-
-      // For each value, emit only unique lines (not already seen)
-      for (Text value : values) {
-        String line = value.toString();
-
-        // Count input bytes
-        context
-          .getCounter(Counters.COMBINER_INPUT_BYTES)
-          .increment(key.getLength() + value.getLength());
-
-        if (!seenLines.contains(line)) {
-          seenLines.add(line);
-          context.write(key, value);
-          context
-            .getCounter("DataCleaner", "Combiner Output Lines")
-            .increment(1);
-
-          // Count output bytes
-          context
-            .getCounter(Counters.COMBINER_OUTPUT_BYTES)
-            .increment(key.getLength() + value.getLength());
-        } else {
-          context
-            .getCounter("DataCleaner", "Combiner Exact Duplicates Removed")
-            .increment(1);
-        }
-      }
-
-      // Measure execution time
-      long endTime = System.nanoTime();
-      context
-        .getCounter(Counters.COMBINER_TIME_MS)
-        .increment((endTime - startTime) / 1_000_000);
-    }
-  }
-
-  /**
    * Reducer that eliminates exact duplicates and games with timestamps within ±10 seconds.
    */
   public static class CleanReducer
@@ -348,9 +299,6 @@ public class DataCleaner extends Configured implements Tool {
     job.setMapperClass(CleanMapper.class);
     job.setMapOutputKeyClass(Text.class);
     job.setMapOutputValueClass(Text.class);
-
-    // Combiner configuration
-    job.setCombinerClass(CleanCombiner.class);
 
     // Reducer configuration
     job.setReducerClass(CleanReducer.class);
