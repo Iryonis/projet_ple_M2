@@ -102,9 +102,30 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     conf.set("mapreduce.map.output.compress.codec",
              "org.apache.hadoop.io.compress.SnappyCodec");
 
-    // Increase map output buffer for high-volume emission
+    // ===== MAPPER MEMORY BUFFERS =====
+    // Increase sort buffer to reduce spills (default 100MB)
+    // With 4.6B edges for 37M games, we need large buffers
     conf.setInt("mapreduce.task.io.sort.mb", 512);
-    conf.setFloat("mapreduce.map.sort.spill.percent", 0.9f);
+    // Spill threshold: higher = fewer spills but more memory (default 0.80)
+    conf.setFloat("mapreduce.map.sort.spill.percent", 0.90f);
+    // Sort factor: merge streams during spill merge (default 10)
+    conf.setInt("mapreduce.task.io.sort.factor", 50);
+    
+    // ===== REDUCER SHUFFLE BUFFERS =====
+    // Buffer for shuffle data in memory (default 0.70 of heap)
+    conf.setFloat("mapreduce.reduce.shuffle.input.buffer.percent", 0.80f);
+    // When to start merging shuffle data (default 0.66)
+    conf.setFloat("mapreduce.reduce.shuffle.merge.percent", 0.80f);
+    // Memory-to-memory merge threshold (default 0)
+    conf.setFloat("mapreduce.reduce.input.buffer.percent", 0.80f);
+    // Parallel copies during shuffle (default 5)
+    conf.setInt("mapreduce.reduce.shuffle.parallelcopies", 20);
+    
+    // ===== FORCE MORE MAPPERS =====
+    // Default is 128MB, we set to 16MB to get ~8x more mappers
+    // This is the KEY optimization for cluster utilization
+    conf.setLong("mapreduce.input.fileinputformat.split.maxsize", 16 * 1024 * 1024);
+    conf.setLong("mapreduce.input.fileinputformat.split.minsize", 8 * 1024 * 1024);
   }
 
   private Job runNodesJob(Configuration conf, int k, int numReducers,
