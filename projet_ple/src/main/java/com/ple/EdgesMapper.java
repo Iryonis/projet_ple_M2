@@ -57,8 +57,16 @@ public class EdgesMapper extends Mapper<NullWritable, Text, EdgeKey, LongWritabl
   @Override
   protected void map(NullWritable key, Text val, Context ctx)
       throws IOException, InterruptedException {
+    long startTime = System.nanoTime();
+    
+    // Count input bytes
+    ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.MAPPER_INPUT_BYTES)
+        .increment(val.getLength());
+    
     if (!game.parseFromJson(val.toString())) {
       skipped.increment(1);
+      ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.MAPPER_TIME_MS)
+          .increment((System.nanoTime() - startTime) / 1_000_000);
       return;
     }
     processed.increment(1);
@@ -71,6 +79,10 @@ public class EdgesMapper extends Mapper<NullWritable, Text, EdgeKey, LongWritabl
     if (localMapEntries >= MAX_MAP_SIZE * FLUSH_THRESHOLD) {
       flush(ctx);
     }
+    
+    // Measure execution time
+    ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.MAPPER_TIME_MS)
+        .increment((System.nanoTime() - startTime) / 1_000_000);
   }
 
   @Override
@@ -89,6 +101,9 @@ public class EdgesMapper extends Mapper<NullWritable, Text, EdgeKey, LongWritabl
         outKey.set(src, tgt);
         outVal.set(pack(v[0], v[1]));
         ctx.write(outKey, outVal);
+        // Count output bytes (EdgeKey = 16 bytes + value = 8 bytes = 24 bytes)
+        ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.MAPPER_OUTPUT_BYTES)
+            .increment(24);
         localEmitCount++;
       }
     }

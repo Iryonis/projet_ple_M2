@@ -93,6 +93,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
         .getValue();
     
     printSummary(t1 - t0, numGames, numNodes, numEdges, outBase);
+    printPerformanceMetrics(nodesJob, edgesJob);
     return 0;
   }
 
@@ -260,6 +261,104 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.println("╠════════════════════════════════════════════════════╣");
     System.out.println("║  Output: " + outBase + "/nodes, " + outBase + "/edges");
     System.out.println("╚════════════════════════════════════════════════════╝");
+  }
+
+  private void printPerformanceMetrics(Job nodesJob, Job edgesJob) throws Exception {
+    System.out.println("\n\n╔════════════════════════════════════════════════════╗");
+    System.out.println("║           PERFORMANCE METRICS (BENCHMARK)          ║");
+    System.out.println("╚════════════════════════════════════════════════════╝");
+
+    // ===== NODES JOB METRICS =====
+    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    System.out.println("  NODES JOB");
+    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    printJobMetrics(nodesJob, NodesEdgesMetrics.NodesMetrics.class);
+
+    // ===== EDGES JOB METRICS =====
+    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    System.out.println("  EDGES JOB");
+    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    printJobMetrics(edgesJob, NodesEdgesMetrics.EdgesMetrics.class);
+
+    // ===== OVERALL STATS =====
+    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    System.out.println("  OVERALL STATISTICS");
+    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    
+    org.apache.hadoop.mapreduce.Counters nodesCounters = nodesJob.getCounters();
+    org.apache.hadoop.mapreduce.Counters edgesCounters = edgesJob.getCounters();
+    
+    long nodesMapperInput = getCounter(nodesCounters, NodesEdgesMetrics.NodesMetrics.class, "MAPPER_INPUT_BYTES");
+    long nodesReducerOutput = getCounter(nodesCounters, NodesEdgesMetrics.NodesMetrics.class, "REDUCER_OUTPUT_BYTES");
+    long edgesMapperInput = getCounter(edgesCounters, NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_INPUT_BYTES");
+    long edgesReducerOutput = getCounter(edgesCounters, NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_OUTPUT_BYTES");
+    
+    long totalInput = nodesMapperInput + edgesMapperInput;
+    long totalOutput = nodesReducerOutput + edgesReducerOutput;
+    
+    System.out.printf("  Total input:  %.2f MB%n", totalInput / 1_000_000.0);
+    System.out.printf("  Total output: %.2f MB%n", totalOutput / 1_000_000.0);
+    if (totalInput > 0) {
+      System.out.printf("  Total reduction: %.2f%%%n", (1 - (double) totalOutput / totalInput) * 100);
+    }
+    
+    System.out.println("\n");
+  }
+
+  private void printJobMetrics(Job job, Class<?> metricsEnum) throws Exception {
+    org.apache.hadoop.mapreduce.Counters counters = job.getCounters();
+
+    // Mapper metrics
+    long mapperInputBytes = getCounter(counters, metricsEnum, "MAPPER_INPUT_BYTES");
+    long mapperOutputBytes = getCounter(counters, metricsEnum, "MAPPER_OUTPUT_BYTES");
+    long mapperTimeMs = getCounter(counters, metricsEnum, "MAPPER_TIME_MS");
+    
+    System.out.println("\n  Mapper:");
+    System.out.printf("    Input:  %.2f MB (%,d bytes)%n", mapperInputBytes / 1_000_000.0, mapperInputBytes);
+    System.out.printf("    Output: %.2f MB (%,d bytes)%n", mapperOutputBytes / 1_000_000.0, mapperOutputBytes);
+    System.out.printf("    Time:   %.2f seconds (%,d ms)%n", mapperTimeMs / 1000.0, mapperTimeMs);
+
+    // Combiner metrics
+    long combinerInputBytes = getCounter(counters, metricsEnum, "COMBINER_INPUT_BYTES");
+    long combinerOutputBytes = getCounter(counters, metricsEnum, "COMBINER_OUTPUT_BYTES");
+    long combinerTimeMs = getCounter(counters, metricsEnum, "COMBINER_TIME_MS");
+    
+    if (combinerInputBytes > 0) {
+      System.out.println("\n  Combiner:");
+      System.out.printf("    Input:  %.2f MB (%,d bytes)%n", combinerInputBytes / 1_000_000.0, combinerInputBytes);
+      System.out.printf("    Output: %.2f MB (%,d bytes)%n", combinerOutputBytes / 1_000_000.0, combinerOutputBytes);
+      System.out.printf("    Time:   %.2f seconds (%,d ms)%n", combinerTimeMs / 1000.0, combinerTimeMs);
+      System.out.printf("    Reduction: %.2f%%%n", (1 - (double) combinerOutputBytes / combinerInputBytes) * 100);
+    }
+
+    // Reducer metrics
+    long reducerInputBytes = getCounter(counters, metricsEnum, "REDUCER_INPUT_BYTES");
+    long reducerOutputBytes = getCounter(counters, metricsEnum, "REDUCER_OUTPUT_BYTES");
+    long reducerTimeMs = getCounter(counters, metricsEnum, "REDUCER_TIME_MS");
+    
+    System.out.println("\n  Reducer:");
+    System.out.printf("    Input:  %.2f MB (%,d bytes)%n", reducerInputBytes / 1_000_000.0, reducerInputBytes);
+    System.out.printf("    Output: %.2f MB (%,d bytes)%n", reducerOutputBytes / 1_000_000.0, reducerOutputBytes);
+    System.out.printf("    Time:   %.2f seconds (%,d ms)%n", reducerTimeMs / 1000.0, reducerTimeMs);
+    if (reducerInputBytes > 0) {
+      System.out.printf("    Reduction: %.2f%%%n", (1 - (double) reducerOutputBytes / reducerInputBytes) * 100);
+    }
+  }
+
+  private long getCounter(org.apache.hadoop.mapreduce.Counters counters, Class<?> metricsEnum, String counterName) {
+    try {
+      Object enumValue = null;
+      for (Object e : metricsEnum.getEnumConstants()) {
+        if (e.toString().equals(counterName)) {
+          enumValue = e;
+          break;
+        }
+      }
+      if (enumValue == null) return 0;
+      return counters.findCounter((Enum<?>) enumValue).getValue();
+    } catch (Exception e) {
+      return 0;
+    }
   }
 
   public static void main(String[] args) throws Exception {

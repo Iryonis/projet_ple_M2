@@ -56,8 +56,16 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
   @Override
   protected void map(NullWritable key, Text val, Context ctx)
       throws IOException, InterruptedException {
+    long startTime = System.nanoTime();
+    
+    // Count input bytes
+    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_INPUT_BYTES)
+        .increment(val.getLength());
+    
     if (!game.parseFromJson(val.toString())) {
       skipped.increment(1);
+      ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_TIME_MS)
+          .increment((System.nanoTime() - startTime) / 1_000_000);
       return;
     }
     processed.increment(1);
@@ -72,6 +80,10 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
     if (localMap.size() >= MAX_MAP_SIZE * FLUSH_THRESHOLD) {
       flush(ctx);
     }
+    
+    // Measure execution time
+    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_TIME_MS)
+        .increment((System.nanoTime() - startTime) / 1_000_000);
   }
 
   @Override
@@ -87,6 +99,9 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
       long[] v = e.getValue();
       outVal.set(pack(v[0], v[1]));
       ctx.write(outKey, outVal);
+      // Count output bytes (key + value = 8 + 8 = 16 bytes)
+      ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_OUTPUT_BYTES)
+          .increment(16);
       localEmitCount++;
     }
     localMap.clear();

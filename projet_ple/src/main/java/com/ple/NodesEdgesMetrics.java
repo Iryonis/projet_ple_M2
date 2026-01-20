@@ -11,13 +11,33 @@ public final class NodesEdgesMetrics {
   public static enum NodesMetrics {
     GAMES_PROCESSED,
     GAMES_SKIPPED,
-    NODES_EMITTED
+    NODES_EMITTED,
+    // Performance metrics
+    MAPPER_INPUT_BYTES,
+    MAPPER_OUTPUT_BYTES,
+    MAPPER_TIME_MS,
+    COMBINER_INPUT_BYTES,
+    COMBINER_OUTPUT_BYTES,
+    COMBINER_TIME_MS,
+    REDUCER_INPUT_BYTES,
+    REDUCER_OUTPUT_BYTES,
+    REDUCER_TIME_MS
   }
 
   /** Counters for edges job */
   public static enum EdgesMetrics {
     GAMES_PROCESSED,
     GAMES_SKIPPED,
-    EDGES_EMITTED
+    EDGES_EMITTED,
+    // Performance metrics
+    MAPPER_INPUT_BYTES,
+    MAPPER_OUTPUT_BYTES,
+    MAPPER_TIME_MS,
+    COMBINER_INPUT_BYTES,
+    COMBINER_OUTPUT_BYTES,
+    COMBINER_TIME_MS,
+    REDUCER_INPUT_BYTES,
+    REDUCER_OUTPUT_BYTES,
+    REDUCER_TIME_MS
   }
 }

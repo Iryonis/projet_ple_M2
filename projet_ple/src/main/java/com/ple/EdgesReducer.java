@@ -26,11 +26,15 @@ public class EdgesReducer extends Reducer<EdgeKey, LongWritable, NullWritable, T
   @Override
   protected void reduce(EdgeKey key, Iterable<LongWritable> vals, Context ctx)
       throws IOException, InterruptedException {
+    long startTime = System.nanoTime();
     long count = 0, wins = 0;
     for (LongWritable v : vals) {
       long p = v.get();
       count += unpackCount(p);
       wins += unpackWins(p);
+      // Count input bytes (EdgeKey = 16 bytes + value = 8 bytes = 24 bytes)
+      ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.REDUCER_INPUT_BYTES)
+          .increment(24);
     }
     out.set(
       toHex(key.getSource(), k) + ";" +
@@ -38,5 +42,11 @@ public class EdgesReducer extends Reducer<EdgeKey, LongWritable, NullWritable, T
       count + ";" + wins
     );
     ctx.write(NullWritable.get(), out);
+    // Count output bytes (output text length)
+    ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.REDUCER_OUTPUT_BYTES)
+        .increment(out.getLength());
+    // Measure execution time
+    ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.REDUCER_TIME_MS)
+        .increment((System.nanoTime() - startTime) / 1_000_000);
   }
 }

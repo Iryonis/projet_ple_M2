@@ -19,13 +19,23 @@ public class NodesCombiner extends Reducer<LongWritable, LongWritable, LongWrita
   @Override
   protected void reduce(LongWritable key, Iterable<LongWritable> vals, Context ctx)
       throws IOException, InterruptedException {
+    long startTime = System.nanoTime();
     long count = 0, wins = 0;
     for (LongWritable v : vals) {
       long p = v.get();
       count += unpackCount(p);
       wins += unpackWins(p);
+      // Count input bytes (key + value = 8 + 8 = 16 bytes)
+      ctx.getCounter(NodesEdgesMetrics.NodesMetrics.COMBINER_INPUT_BYTES)
+          .increment(16);
     }
     out.set(pack(count, wins));
     ctx.write(key, out);
+    // Count output bytes (key + value = 8 + 8 = 16 bytes)
+    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.COMBINER_OUTPUT_BYTES)
+        .increment(16);
+    // Measure execution time
+    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.COMBINER_TIME_MS)
+        .increment((System.nanoTime() - startTime) / 1_000_000);
   }
 }
