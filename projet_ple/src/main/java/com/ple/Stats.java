@@ -300,6 +300,23 @@ public class Stats extends Configured implements Tool {
       fs.delete(outputPath, true);
     }
 
+    // ===== PERFORMANCE OPTIMIZATIONS =====
+    // Enable map output compression (reduces shuffle I/O significantly)
+    conf.setBoolean("mapreduce.map.output.compress", true);
+    conf.set("mapreduce.map.output.compress.codec",
+             "org.apache.hadoop.io.compress.SnappyCodec");
+
+    // Mapper memory buffers
+    conf.setInt("mapreduce.task.io.sort.mb", 512);
+    conf.setFloat("mapreduce.map.sort.spill.percent", 0.90f);
+    conf.setInt("mapreduce.task.io.sort.factor", 50);
+    
+    // Reducer shuffle buffers (critical for 308 GB shuffle!)
+    conf.setFloat("mapreduce.reduce.shuffle.input.buffer.percent", 0.80f);
+    conf.setFloat("mapreduce.reduce.shuffle.merge.percent", 0.80f);
+    conf.setFloat("mapreduce.reduce.input.buffer.percent", 0.80f);
+    conf.setInt("mapreduce.reduce.shuffle.parallelcopies", 20);
+
     // Configure job
     Job job = Job.getInstance(conf, "Stats Generation - Reduce-Side Join");
     job.setJarByClass(Stats.class);
