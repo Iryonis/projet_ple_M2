@@ -72,9 +72,30 @@ public class Stats extends Configured implements Tool {
     private final Text outKey = new Text();
     private final Text outValue = new Text();
 
+    private boolean fileSizeReported = false;
+
     @Override
     protected void map(LongWritable key, Text value, Context context)
       throws IOException, InterruptedException {
+      // Mesure la taille du fichier d'entrée une seule fois
+      if (!fileSizeReported) {
+        try {
+          FileSystem fs = FileSystem.get(context.getConfiguration());
+          String inputPathStr = context.getInputSplit().toString();
+          // Extraction du chemin réel du fichier
+          String filePath = inputPathStr.replaceAll(".*path:(.*?),.*", "$1");
+          Path path = new Path(filePath);
+          long fileSize = fs.getFileStatus(path).getLen();
+          context
+            .getCounter("Stats", "InputFileSize (bytes)")
+            .increment(fileSize);
+        } catch (Exception e) {
+          // En cas d'erreur, ignorer
+        }
+        fileSizeReported = true;
+      }
+
+      long startTime = System.nanoTime();
       String line = value.toString().trim();
 
       // Parse: archetype;count;wins
@@ -91,6 +112,11 @@ public class Stats extends Configured implements Tool {
 
       context.write(outKey, outValue);
       context.getCounter("Stats", "Nodes Read").increment(1);
+      long endTime = System.nanoTime();
+      long durationMs = (endTime - startTime) / 1_000_000;
+      context
+        .getCounter("Stats", "NodesMapper Time (ms)")
+        .increment(durationMs);
     }
   }
 
@@ -111,6 +137,7 @@ public class Stats extends Configured implements Tool {
     @Override
     protected void map(LongWritable key, Text value, Context context)
       throws IOException, InterruptedException {
+      long startTime = System.nanoTime();
       String line = value.toString().trim();
 
       // Parse: source;target;count;wins
@@ -134,6 +161,11 @@ public class Stats extends Configured implements Tool {
       context.write(outKey, outValue);
 
       context.getCounter("Stats", "Edges Read").increment(1);
+      long endTime = System.nanoTime();
+      long durationMs = (endTime - startTime) / 1_000_000;
+      context
+        .getCounter("Stats", "EdgesMapper Time (ms)")
+        .increment(durationMs);
     }
   }
 
@@ -160,6 +192,7 @@ public class Stats extends Configured implements Tool {
     @Override
     protected void reduce(Text key, Iterable<Text> values, Context context)
       throws IOException, InterruptedException {
+      long startTime = System.nanoTime();
       String archetype = key.toString();
       long archetypeCount = 0;
       List<String[]> edges = new ArrayList<>();
@@ -233,6 +266,9 @@ public class Stats extends Configured implements Tool {
           context.getCounter("Stats", "Edges Enriched").increment(1);
         }
       }
+      long endTime = System.nanoTime();
+      long durationMs = (endTime - startTime) / 1_000_000;
+      context.getCounter("Stats", "Reducer Time (ms)").increment(durationMs);
     }
   }
 
@@ -303,14 +339,16 @@ public class Stats extends Configured implements Tool {
     // ===== PERFORMANCE OPTIMIZATIONS =====
     // Enable map output compression (reduces shuffle I/O significantly)
     conf.setBoolean("mapreduce.map.output.compress", true);
-    conf.set("mapreduce.map.output.compress.codec",
-             "org.apache.hadoop.io.compress.SnappyCodec");
+    conf.set(
+      "mapreduce.map.output.compress.codec",
+      "org.apache.hadoop.io.compress.SnappyCodec"
+    );
 
     // Mapper memory buffers
     conf.setInt("mapreduce.task.io.sort.mb", 512);
     conf.setFloat("mapreduce.map.sort.spill.percent", 0.90f);
     conf.setInt("mapreduce.task.io.sort.factor", 50);
-    
+
     // Reducer shuffle buffers (critical for 308 GB shuffle!)
     conf.setFloat("mapreduce.reduce.shuffle.input.buffer.percent", 0.80f);
     conf.setFloat("mapreduce.reduce.shuffle.merge.percent", 0.80f);
