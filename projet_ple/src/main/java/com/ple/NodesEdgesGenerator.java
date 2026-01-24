@@ -42,14 +42,27 @@ public class NodesEdgesGenerator extends Configured implements Tool {
 
   @Override
   public int run(String[] args) throws Exception {
-    if (args.length < 3 || args.length > 4) {
+    if (args.length < 3 || args.length > 5) {
       printUsage();
       return 1;
     }
 
     Configuration conf = getConf();
     int k = Integer.parseInt(args[2]);
-    int numReducers = args.length == 4 ? Integer.parseInt(args[3]) : 10;
+    
+    // Parse reducer counts:
+    // 3 args: default NODES=1, EDGES=10
+    // 4 args: NODES=1, EDGES=args[3]
+    // 5 args: NODES=args[3], EDGES=args[4]
+    int numReducersNodes = 1;  // Default: 1 reducer for NODES (optimal for small output)
+    int numReducersEdges = 10; // Default: 10 reducers for EDGES
+    
+    if (args.length == 4) {
+      numReducersEdges = Integer.parseInt(args[3]);
+    } else if (args.length == 5) {
+      numReducersNodes = Integer.parseInt(args[3]);
+      numReducersEdges = Integer.parseInt(args[4]);
+    }
 
     if (k < 1 || k > 8) {
       System.err.println("Error: k must be 1-8");
@@ -57,7 +70,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     }
 
     configureJob(conf, k);
-    printBanner(k, numReducers);
+    printBanner(k, numReducersNodes, numReducersEdges);
 
     Path input = new Path(args[0]);
     Path outBase = new Path(args[1]);
@@ -68,32 +81,27 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     long t0 = System.currentTimeMillis();
 
     // ===== JOB 1: NODES =====
-    Job nodesJob = runNodesJob(conf, k, numReducers, input, nodesOut, fs);
+    long tNodesStart = System.currentTimeMillis();
+    Job nodesJob = runNodesJob(conf, k, numReducersNodes, input, nodesOut, fs);
+    long tNodesEnd = System.currentTimeMillis();
     if (nodesJob == null) {
       return 1;
     }
 
     // ===== JOB 2: EDGES =====
-    Job edgesJob = runEdgesJob(conf, k, numReducers, input, edgesOut, fs);
+    long tEdgesStart = System.currentTimeMillis();
+    Job edgesJob = runEdgesJob(conf, k, numReducersEdges, input, edgesOut, fs);
+    long tEdgesEnd = System.currentTimeMillis();
     if (edgesJob == null) {
       return 1;
     }
 
     long t1 = System.currentTimeMillis();
+
+    // Pass measured wall times to the report
+    printFinalReport(k, t1 - t0, nodesJob, edgesJob, outBase, 
+                     tNodesEnd - tNodesStart, tEdgesEnd - tEdgesStart);
     
-    // Count final output records and games processed
-    long numNodes = nodesJob.getCounters()
-        .findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS")
-        .getValue();
-    long numEdges = edgesJob.getCounters()
-        .findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS")
-        .getValue();
-    long numGames = nodesJob.getCounters()
-        .findCounter(NodesEdgesMetrics.NodesMetrics.GAMES_PROCESSED)
-        .getValue();
-    
-    printSummary(t1 - t0, numGames, numNodes, numEdges, outBase);
-    printPerformanceMetrics(nodesJob, edgesJob);
     return 0;
   }
 
@@ -213,11 +221,17 @@ public class NodesEdgesGenerator extends Configured implements Tool {
   }
 
   private void printUsage() {
-    System.err.println("Usage: nodesedges <input> <output> <k> [numReducers]");
-    System.err.println("  input:        SequenceFile from DataCleaner");
-    System.err.println("  output:       Output directory (creates /nodes and /edges)");
-    System.err.println("  k:            Archetype size (1-8, recommended: 6-7)");
-    System.err.println("  numReducers:  Optional (default: 10)");
+    System.err.println("Usage: nodesedges <input> <output> <k> [numReducersEdges] [numReducersNodes numReducersEdges]");
+    System.err.println("  input:              SequenceFile from DataCleaner");
+    System.err.println("  output:             Output directory (creates /nodes and /edges)");
+    System.err.println("  k:                  Archetype size (1-8, recommended: 6-7)");
+    System.err.println("  numReducersEdges:   Optional, reducers for EDGES job (default: 10, NODES: 1)");
+    System.err.println("  numReducersNodes:   Optional, reducers for NODES job (requires numReducersEdges)");
+    System.err.println();
+    System.err.println("Examples:");
+    System.err.println("  nodesedges input.seq output 7           # NODES=1, EDGES=10");
+    System.err.println("  nodesedges input.seq output 7 150       # NODES=1, EDGES=150");
+    System.err.println("  nodesedges input.seq output 7 2 150     # NODES=2, EDGES=150");
     System.err.println();
     System.err.println("OPTIMIZATIONS:");
     System.err.println("  ✓ IN-MAPPER COMBINING (local aggregation)");
@@ -227,7 +241,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.err.println("  ✓ Raw comparator for EdgeKey");
   }
 
-  private void printBanner(int k, int numReducers) {
+  private void printBanner(int k, int numReducersNodes, int numReducersEdges) {
     int comb = binomial(8, k);
     int edges = comb * comb * 2;
 
@@ -236,7 +250,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.println("╠════════════════════════════════════════════════════╣");
     System.out.printf("║  k=%d, C(8,%d)=%d archetypes/deck                   ║%n", k, k, comb);
     System.out.printf("║  Nodes/game: %d, Edges/game: %,d                    ║%n", comb * 2, edges);
-    System.out.printf("║  Reducers: %d                                       ║%n", numReducers);
+    System.out.printf("║  Reducers: NODES=%d, EDGES=%d                       ║%n", numReducersNodes, numReducersEdges);
 
     if (k <= 5) {
       System.out.println("╠════════════════════════════════════════════════════╣");
@@ -250,99 +264,87 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.println("╚════════════════════════════════════════════════════╝");
   }
 
-  private void printSummary(long totalMs, long numGames, long numNodes, long numEdges, Path outBase) {
-    System.out.println("\n╔════════════════════════════════════════════════════╗");
-    System.out.println("║              GENERATION COMPLETE                   ║");
-    System.out.println("╠════════════════════════════════════════════════════╣");
-    System.out.printf("║  TOTAL TIME:       %.1f seconds                    ║%n", totalMs / 1000.0);
-    System.out.printf("║  GAMES PROCESSED:  %,d                             ║%n", numGames);
-    System.out.printf("║  NODES CREATED:    %,d                             ║%n", numNodes);
-    System.out.printf("║  EDGES CREATED:    %,d                             ║%n", numEdges);
-    System.out.println("╠════════════════════════════════════════════════════╣");
-    System.out.println("║  Output: " + outBase + "/nodes, " + outBase + "/edges");
-    System.out.println("╚════════════════════════════════════════════════════╝");
-  }
+  private void printFinalReport(int k, long totalMs, Job nodesJob, Job edgesJob, Path outBase, long nWallTime, long eWallTime) throws Exception {
+    // --- DATA COLLECTION ---
+    // Counters Nodes
+    long nGames = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "GAMES_PROCESSED");
+    long nNodes = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "NODES_EMITTED");
+    long nMapIn = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_INPUT_BYTES");
+    long nRedOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "REDUCER_OUTPUT_BYTES");
+    long nMapTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_TIME_MS");
+    long nCombTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_TIME_MS");
+    long nRedTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "REDUCER_TIME_MS");
+    long nCombIn = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_INPUT_BYTES");
+    long nCombOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_OUTPUT_BYTES");
+    int nReducers = nodesJob.getConfiguration().getInt("mapreduce.job.reduces", 1);
 
-  private void printPerformanceMetrics(Job nodesJob, Job edgesJob) throws Exception {
-    System.out.println("\n\n╔════════════════════════════════════════════════════╗");
-    System.out.println("║           PERFORMANCE METRICS (BENCHMARK)          ║");
-    System.out.println("╚════════════════════════════════════════════════════╝");
+    // Counters Edges
+    long eEdges = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "EDGES_EMITTED");
+    long eRedOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_OUTPUT_BYTES");
+    long eMapTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_TIME_MS");
+    long eCombTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_TIME_MS");
+    long eRedTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_TIME_MS");
+    long eCombIn = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_INPUT_BYTES");
+    long eCombOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_OUTPUT_BYTES");
+    int eReducers = edgesJob.getConfiguration().getInt("mapreduce.job.reduces", 1);
 
-    // ===== NODES JOB METRICS =====
-    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    System.out.println("  NODES JOB");
-    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    printJobMetrics(nodesJob, NodesEdgesMetrics.NodesMetrics.class);
+    // Calculations
+    double totalInputMB = nMapIn / 1_000_000.0;
+    double totalOutputMB = (nRedOut + eRedOut) / 1_000_000.0;
+    double expansion = totalInputMB > 0 ? totalOutputMB / totalInputMB : 0;
+    
+    double nCombReduc = nCombIn > 0 ? (1.0 - (double)nCombOut/nCombIn) * 100 : 0;
+    double eCombReduc = eCombIn > 0 ? (1.0 - (double)eCombOut/eCombIn) * 100 : 0;
 
-    // ===== EDGES JOB METRICS =====
-    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    System.out.println("  EDGES JOB");
-    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    printJobMetrics(edgesJob, NodesEdgesMetrics.EdgesMetrics.class);
+    double nAvgFileMB = nReducers > 0 ? (nRedOut / 1_000_000.0) / nReducers : 0;
+    double eAvgFileMB = eReducers > 0 ? (eRedOut / 1_000_000.0) / eReducers : 0;
 
-    // ===== OVERALL STATS =====
-    System.out.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    System.out.println("  OVERALL STATISTICS");
-    System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    
-    org.apache.hadoop.mapreduce.Counters nodesCounters = nodesJob.getCounters();
-    org.apache.hadoop.mapreduce.Counters edgesCounters = edgesJob.getCounters();
-    
-    long nodesMapperInput = getCounter(nodesCounters, NodesEdgesMetrics.NodesMetrics.class, "MAPPER_INPUT_BYTES");
-    long nodesReducerOutput = getCounter(nodesCounters, NodesEdgesMetrics.NodesMetrics.class, "REDUCER_OUTPUT_BYTES");
-    long edgesMapperInput = getCounter(edgesCounters, NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_INPUT_BYTES");
-    long edgesReducerOutput = getCounter(edgesCounters, NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_OUTPUT_BYTES");
-    
-    long totalInput = nodesMapperInput + edgesMapperInput;
-    long totalOutput = nodesReducerOutput + edgesReducerOutput;
-    
-    System.out.printf("  Total input:  %.2f MB%n", totalInput / 1_000_000.0);
-    System.out.printf("  Total output: %.2f MB%n", totalOutput / 1_000_000.0);
-    if (totalInput > 0) {
-      System.out.printf("  Total reduction: %.2f%%%n", (1 - (double) totalOutput / totalInput) * 100);
-    }
-    
-    System.out.println("\n");
-  }
+    // OPTIMIZATION SUGGESTIONS (Target: 128MB HDFS Block)
+    long HDFS_BLOCK_SIZE = 128 * 1024 * 1024;
+    int nOptimalReducers = (int) Math.max(1, (nRedOut + HDFS_BLOCK_SIZE - 1) / HDFS_BLOCK_SIZE);
+    int eOptimalReducers = (int) Math.max(1, (eRedOut + HDFS_BLOCK_SIZE - 1) / HDFS_BLOCK_SIZE);
 
-  private void printJobMetrics(Job job, Class<?> metricsEnum) throws Exception {
-    org.apache.hadoop.mapreduce.Counters counters = job.getCounters();
-
-    // Mapper metrics
-    long mapperInputBytes = getCounter(counters, metricsEnum, "MAPPER_INPUT_BYTES");
-    long mapperOutputBytes = getCounter(counters, metricsEnum, "MAPPER_OUTPUT_BYTES");
-    long mapperTimeMs = getCounter(counters, metricsEnum, "MAPPER_TIME_MS");
+    // --- PRINTING ---
+    System.out.println("\n╔════════════════════════════════════════════════════════════════╗");
+    System.out.printf("║             NODES & EDGES GENERATION REPORT (k=%d)              ║%n", k);
+    System.out.println("╠════════════════════════════════════════════════════════════════╣");
     
-    System.out.println("\n  Mapper:");
-    System.out.printf("    Input:  %.2f MB (%,d bytes)%n", mapperInputBytes / 1_000_000.0, mapperInputBytes);
-    System.out.printf("    Output: %.2f MB (%,d bytes)%n", mapperOutputBytes / 1_000_000.0, mapperOutputBytes);
-    System.out.printf("    Time:   %.2f seconds (%,d ms)%n", mapperTimeMs / 1000.0, mapperTimeMs);
+    // GLOBAL SECTION
+    System.out.println("║  EXECUTION SUMMARY                                             ║");
+    System.out.printf("║    Total Duration:   %-15s                           ║%n", String.format("%.1f s", totalMs / 1000.0));
+    System.out.printf("║    Games Processed:  %-15s                           ║%n", String.format("%,d", nGames));
+    System.out.printf("║    Total Input:      %-15s                           ║%n", String.format("%.2f MB", totalInputMB));
+    System.out.printf("║    Total Output:     %-15s                           ║%n", String.format("%.2f MB", totalOutputMB));
+    System.out.printf("║    Expansion Factor: %-15s                           ║%n", String.format("%.2fx", expansion));
 
-    // Combiner metrics
-    long combinerInputBytes = getCounter(counters, metricsEnum, "COMBINER_INPUT_BYTES");
-    long combinerOutputBytes = getCounter(counters, metricsEnum, "COMBINER_OUTPUT_BYTES");
-    long combinerTimeMs = getCounter(counters, metricsEnum, "COMBINER_TIME_MS");
+    System.out.println("╠════════════════════════════════════════════════════════════════╣");
     
-    if (combinerInputBytes > 0) {
-      System.out.println("\n  Combiner:");
-      System.out.printf("    Input:  %.2f MB (%,d bytes)%n", combinerInputBytes / 1_000_000.0, combinerInputBytes);
-      System.out.printf("    Output: %.2f MB (%,d bytes)%n", combinerOutputBytes / 1_000_000.0, combinerOutputBytes);
-      System.out.printf("    Time:   %.2f seconds (%,d ms)%n", combinerTimeMs / 1000.0, combinerTimeMs);
-      System.out.printf("    Reduction: %.2f%%%n", (1 - (double) combinerOutputBytes / combinerInputBytes) * 100);
-    }
+    // NODES SECTION
+    System.out.println("║  JOB 1: NODES                                                  ║");
+    System.out.printf("║    Job Duration:     %-15s                           ║%n", String.format("%.1f s", nWallTime / 1000.0));
+    System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d nodes", nNodes));
+    System.out.printf("║    Mapper CPU:       %-15s                           ║%n", String.format("%.2f s", nMapTime/1000.0));
+    System.out.printf("║    Combiner:         %-15s                           ║%n", String.format("%.1f%% red. (%.2fs)", nCombReduc, nCombTime/1000.0));
+    System.out.printf("║    Reducer CPU:      %-15s                           ║%n", String.format("%.2f s", nRedTime/1000.0));
+    System.out.printf("║    Output Files:     %-15s                           ║%n", String.format("%d (avg %.1f MB)", nReducers, nAvgFileMB));
+    System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", nOptimalReducers));
 
-    // Reducer metrics
-    long reducerInputBytes = getCounter(counters, metricsEnum, "REDUCER_INPUT_BYTES");
-    long reducerOutputBytes = getCounter(counters, metricsEnum, "REDUCER_OUTPUT_BYTES");
-    long reducerTimeMs = getCounter(counters, metricsEnum, "REDUCER_TIME_MS");
+    System.out.println("╠════════════════════════════════════════════════════════════════╣");
     
-    System.out.println("\n  Reducer:");
-    System.out.printf("    Input:  %.2f MB (%,d bytes)%n", reducerInputBytes / 1_000_000.0, reducerInputBytes);
-    System.out.printf("    Output: %.2f MB (%,d bytes)%n", reducerOutputBytes / 1_000_000.0, reducerOutputBytes);
-    System.out.printf("    Time:   %.2f seconds (%,d ms)%n", reducerTimeMs / 1000.0, reducerTimeMs);
-    if (reducerInputBytes > 0) {
-      System.out.printf("    Reduction: %.2f%%%n", (1 - (double) reducerOutputBytes / reducerInputBytes) * 100);
-    }
+    // EDGES SECTION
+    System.out.println("║  JOB 2: EDGES                                                  ║");
+    System.out.printf("║    Job Duration:     %-15s                           ║%n", String.format("%.1f s", eWallTime / 1000.0));
+    System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d edges", eEdges));
+    System.out.printf("║    Mapper CPU:       %-15s                           ║%n", String.format("%.2f s", eMapTime/1000.0));
+    System.out.printf("║    Combiner:         %-15s                           ║%n", String.format("%.1f%% red. (%.2fs)", eCombReduc, eCombTime/1000.0));
+    System.out.printf("║    Reducer CPU:      %-15s                           ║%n", String.format("%.2f s", eRedTime/1000.0));
+    System.out.printf("║    Output Files:     %-15s                           ║%n", String.format("%d (avg %.1f MB)", eReducers, eAvgFileMB));
+    System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", eOptimalReducers));
+    
+    System.out.println("╚════════════════════════════════════════════════════════════════╝");
+    System.out.println("Output locations:");
+    System.out.println("Nodes: " + new Path(outBase, "nodes"));
+    System.out.println("Edges: " + new Path(outBase, "edges"));
   }
 
   private long getCounter(org.apache.hadoop.mapreduce.Counters counters, Class<?> metricsEnum, String counterName) {

@@ -13,6 +13,7 @@ import org.apache.hadoop.mapreduce.Reducer;
 public class EdgesCombiner extends Reducer<EdgeKey, LongWritable, EdgeKey, LongWritable> {
 
   private final LongWritable out = new LongWritable();
+  private long totalTimeNs = 0;
 
   @Override
   protected void reduce(EdgeKey key, Iterable<LongWritable> vals, Context ctx)
@@ -32,8 +33,14 @@ public class EdgesCombiner extends Reducer<EdgeKey, LongWritable, EdgeKey, LongW
     // Count output bytes (EdgeKey = 16 bytes + value = 8 bytes = 24 bytes)
     ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.COMBINER_OUTPUT_BYTES)
         .increment(24);
-    // Measure execution time
+    // Accumulate execution time
+    totalTimeNs += (System.nanoTime() - startTime);
+  }
+
+  @Override
+  protected void cleanup(Context ctx) throws IOException, InterruptedException {
+    // Convert accumulated time to milliseconds
     ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.COMBINER_TIME_MS)
-        .increment((System.nanoTime() - startTime) / 1_000_000);
+        .increment(totalTimeNs / 1_000_000);
   }
 }

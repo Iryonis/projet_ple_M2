@@ -42,6 +42,7 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
   // Key: archetype (long), Value: [count, wins]
   private HashMap<Long, long[]> localMap;
   private long localEmitCount;
+  private long totalTimeNs = 0;
 
   @Override
   protected void setup(Context ctx) {
@@ -64,8 +65,7 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
     
     if (!game.parseFromJson(val.toString())) {
       skipped.increment(1);
-      ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_TIME_MS)
-          .increment((System.nanoTime() - startTime) / 1_000_000);
+      totalTimeNs += (System.nanoTime() - startTime);
       return;
     }
     processed.increment(1);
@@ -81,15 +81,17 @@ public class NodesMapper extends Mapper<NullWritable, Text, LongWritable, LongWr
       flush(ctx);
     }
     
-    // Measure execution time
-    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_TIME_MS)
-        .increment((System.nanoTime() - startTime) / 1_000_000);
+    // Accumulate execution time
+    totalTimeNs += (System.nanoTime() - startTime);
   }
 
   @Override
   protected void cleanup(Context ctx) throws IOException, InterruptedException {
     flush(ctx);
     emitted.increment(localEmitCount);
+    // Convert accumulated time to milliseconds
+    ctx.getCounter(NodesEdgesMetrics.NodesMetrics.MAPPER_TIME_MS)
+        .increment(totalTimeNs / 1_000_000);
   }
 
   /** Flush local map to context */

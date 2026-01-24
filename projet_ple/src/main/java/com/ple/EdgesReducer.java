@@ -17,6 +17,7 @@ public class EdgesReducer extends Reducer<EdgeKey, LongWritable, NullWritable, T
 
   private final Text out = new Text();
   private int k;
+  private long totalTimeNs = 0;
 
   @Override
   protected void setup(Context ctx) {
@@ -45,8 +46,14 @@ public class EdgesReducer extends Reducer<EdgeKey, LongWritable, NullWritable, T
     // Count output bytes (output text length)
     ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.REDUCER_OUTPUT_BYTES)
         .increment(out.getLength());
-    // Measure execution time
+    // Accumulate execution time
+    totalTimeNs += (System.nanoTime() - startTime);
+  }
+
+  @Override
+  protected void cleanup(Context ctx) throws IOException, InterruptedException {
+    // Convert accumulated time to milliseconds
     ctx.getCounter(NodesEdgesMetrics.EdgesMetrics.REDUCER_TIME_MS)
-        .increment((System.nanoTime() - startTime) / 1_000_000);
+        .increment(totalTimeNs / 1_000_000);
   }
 }
