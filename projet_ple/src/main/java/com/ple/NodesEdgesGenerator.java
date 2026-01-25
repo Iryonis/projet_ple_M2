@@ -270,6 +270,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     long nGames = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "GAMES_PROCESSED");
     long nNodes = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "NODES_EMITTED");
     long nMapIn = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_INPUT_BYTES");
+    long nMapOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_OUTPUT_BYTES");
     long nRedOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "REDUCER_OUTPUT_BYTES");
     long nMapTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_TIME_MS");
     long nCombTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_TIME_MS");
@@ -281,6 +282,8 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     // Counters Edges
     long eEdges = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "EDGES_EMITTED");
     long eRedOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_OUTPUT_BYTES");
+    long eMapIn = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_INPUT_BYTES");
+    long eMapOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_OUTPUT_BYTES");
     long eMapTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_TIME_MS");
     long eCombTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_TIME_MS");
     long eRedTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_TIME_MS");
@@ -291,7 +294,11 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     // Calculations
     double totalInputMB = nMapIn / 1_000_000.0;
     double totalOutputMB = (nRedOut + eRedOut) / 1_000_000.0;
-    double expansion = totalInputMB > 0 ? totalOutputMB / totalInputMB : 0;
+    double throughput = totalMs > 0 ? (totalInputMB / (totalMs / 1000.0)) : 0;
+    
+    // Shuffle volume logic
+    double nShuffleMB = (nCombOut > 0 ? nCombOut : nMapOut) / 1_000_000.0;
+    double eShuffleMB = (eCombOut > 0 ? eCombOut : eMapOut) / 1_000_000.0;
     
     double nCombReduc = nCombIn > 0 ? (1.0 - (double)nCombOut/nCombIn) * 100 : 0;
     double eCombReduc = eCombIn > 0 ? (1.0 - (double)eCombOut/eCombIn) * 100 : 0;
@@ -299,7 +306,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     double nAvgFileMB = nReducers > 0 ? (nRedOut / 1_000_000.0) / nReducers : 0;
     double eAvgFileMB = eReducers > 0 ? (eRedOut / 1_000_000.0) / eReducers : 0;
 
-    // OPTIMIZATION SUGGESTIONS (Target: 128MB HDFS Block)
+    // Optimization Suggestions
     long HDFS_BLOCK_SIZE = 128 * 1024 * 1024;
     int nOptimalReducers = (int) Math.max(1, (nRedOut + HDFS_BLOCK_SIZE - 1) / HDFS_BLOCK_SIZE);
     int eOptimalReducers = (int) Math.max(1, (eRedOut + HDFS_BLOCK_SIZE - 1) / HDFS_BLOCK_SIZE);
@@ -312,33 +319,39 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     // GLOBAL SECTION
     System.out.println("║  EXECUTION SUMMARY                                             ║");
     System.out.printf("║    Total Duration:   %-15s                           ║%n", String.format("%.1f s", totalMs / 1000.0));
+    System.out.printf("║    Throughput:       %-15s                           ║%n", String.format("%.1f MB/s", throughput));
     System.out.printf("║    Games Processed:  %-15s                           ║%n", String.format("%,d", nGames));
     System.out.printf("║    Total Input:      %-15s                           ║%n", String.format("%.2f MB", totalInputMB));
     System.out.printf("║    Total Output:     %-15s                           ║%n", String.format("%.2f MB", totalOutputMB));
-    System.out.printf("║    Expansion Factor: %-15s                           ║%n", String.format("%.2fx", expansion));
 
     System.out.println("╠════════════════════════════════════════════════════════════════╣");
     
     // NODES SECTION
-    System.out.println("║  JOB 1: NODES                                                  ║");
-    System.out.printf("║    Job Duration:     %-15s                           ║%n", String.format("%.1f s", nWallTime / 1000.0));
+    System.out.println("║  JOB 1: NODES (Data Pipeline)                                  ║");
+    System.out.printf("║    1. Input (HDFS):  %-15s                           ║%n", String.format("%.2f MB", nMapIn/1_000_000.0));
+    System.out.printf("║    2. Map Gen (Raw): %-15s                           ║%n", String.format("%.2f MB", nMapOut/1_000_000.0));
+    System.out.printf("║    3. Combiner Red:  %-15s                           ║%n", String.format("%.1f%% (Time: %.2fs)", nCombReduc, nCombTime/1000.0));
+    System.out.printf("║    4. Shuffle (Net): %-15s                           ║%n", String.format("%.2f MB", nShuffleMB));
+    System.out.printf("║    5. Output (HDFS): %-15s                           ║%n", String.format("%.2f MB", nRedOut/1_000_000.0));
+    System.out.println("║  ------------------------------------------------------------  ║");
+    System.out.printf("║    Duration:         %-15s                           ║%n", String.format("%.1f s", nWallTime / 1000.0));
     System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d nodes", nNodes));
-    System.out.printf("║    Mapper CPU:       %-15s                           ║%n", String.format("%.2f s", nMapTime/1000.0));
-    System.out.printf("║    Combiner:         %-15s                           ║%n", String.format("%.1f%% red. (%.2fs)", nCombReduc, nCombTime/1000.0));
-    System.out.printf("║    Reducer CPU:      %-15s                           ║%n", String.format("%.2f s", nRedTime/1000.0));
-    System.out.printf("║    Output Files:     %-15s                           ║%n", String.format("%d (avg %.1f MB)", nReducers, nAvgFileMB));
+    System.out.printf("║    Avg File Size:    %-15s                           ║%n", String.format("%.1f MB (x%d files)", nAvgFileMB, nReducers));
     System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", nOptimalReducers));
 
     System.out.println("╠════════════════════════════════════════════════════════════════╣");
     
     // EDGES SECTION
-    System.out.println("║  JOB 2: EDGES                                                  ║");
-    System.out.printf("║    Job Duration:     %-15s                           ║%n", String.format("%.1f s", eWallTime / 1000.0));
+    System.out.println("║  JOB 2: EDGES (Data Pipeline)                                  ║");
+    System.out.printf("║    1. Input (HDFS):  %-15s                           ║%n", String.format("%.2f MB", eMapIn/1_000_000.0));
+    System.out.printf("║    2. Map Gen (Raw): %-15s                           ║%n", String.format("%.2f MB", eMapOut/1_000_000.0));
+    System.out.printf("║    3. Combiner Red:  %-15s                           ║%n", String.format("%.1f%% (Time: %.2fs)", eCombReduc, eCombTime/1000.0));
+    System.out.printf("║    4. Shuffle (Net): %-15s                           ║%n", String.format("%.2f MB", eShuffleMB));
+    System.out.printf("║    5. Output (HDFS): %-15s                           ║%n", String.format("%.2f MB", eRedOut/1_000_000.0));
+    System.out.println("║  ------------------------------------------------------------  ║");
+    System.out.printf("║    Duration:         %-15s                           ║%n", String.format("%.1f s", eWallTime / 1000.0));
     System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d edges", eEdges));
-    System.out.printf("║    Mapper CPU:       %-15s                           ║%n", String.format("%.2f s", eMapTime/1000.0));
-    System.out.printf("║    Combiner:         %-15s                           ║%n", String.format("%.1f%% red. (%.2fs)", eCombReduc, eCombTime/1000.0));
-    System.out.printf("║    Reducer CPU:      %-15s                           ║%n", String.format("%.2f s", eRedTime/1000.0));
-    System.out.printf("║    Output Files:     %-15s                           ║%n", String.format("%d (avg %.1f MB)", eReducers, eAvgFileMB));
+    System.out.printf("║    Avg File Size:    %-15s                           ║%n", String.format("%.1f MB (x%d files)", eAvgFileMB, eReducers));
     System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", eOptimalReducers));
     
     System.out.println("╚════════════════════════════════════════════════════════════════╝");
