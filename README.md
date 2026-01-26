@@ -46,8 +46,14 @@ yarn jar projet_ple-1.jar nodesedges full full_7 7 2 150
 Analyse statistique des résultats:
 
 ```sh
-yarn jar projet_ple-1.jar stats 1M_7 1M_stats_7
+yarn jar projet_ple-1.jar stats input output
 ```
+
+Récupération des fichiers en un seul sur la gateway temporairement:
+```sh
+hdfs dfs -getmerge input output
+```
+
 
 # Authors
 
