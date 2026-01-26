@@ -54,6 +54,18 @@ Récupération des fichiers en un seul sur la gateway temporairement:
 hdfs dfs -getmerge input output
 ```
 
+### Graph Visualization
+
+Création du graphique à partir des données :
+
+```sh
+python generate_analysis.py input output
+```
+
+Pour plus de points (par défaut 50 000) :
+```sh
+python generate_analysis.py input output --sample 100000
+```
 
 # Authors
 
