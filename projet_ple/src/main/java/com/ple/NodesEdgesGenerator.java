@@ -266,27 +266,25 @@ public class NodesEdgesGenerator extends Configured implements Tool {
 
   private void printFinalReport(int k, long totalMs, Job nodesJob, Job edgesJob, Path outBase, long nWallTime, long eWallTime) throws Exception {
     // --- DATA COLLECTION ---
-    // Counters Nodes
+    // Standard Counters (To get UNIQUE final counts)
+    long nUniqueNodes = nodesJob.getCounters().findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS").getValue();
+    long eUniqueEdges = edgesJob.getCounters().findCounter("org.apache.hadoop.mapreduce.TaskCounter", "REDUCE_OUTPUT_RECORDS").getValue();
+
+    // Counters Nodes (Custom metrics)
     long nGames = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "GAMES_PROCESSED");
-    long nNodes = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "NODES_EMITTED");
     long nMapIn = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_INPUT_BYTES");
     long nMapOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_OUTPUT_BYTES");
     long nRedOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "REDUCER_OUTPUT_BYTES");
-    long nMapTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "MAPPER_TIME_MS");
     long nCombTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_TIME_MS");
-    long nRedTime = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "REDUCER_TIME_MS");
     long nCombIn = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_INPUT_BYTES");
     long nCombOut = getCounter(nodesJob.getCounters(), NodesEdgesMetrics.NodesMetrics.class, "COMBINER_OUTPUT_BYTES");
     int nReducers = nodesJob.getConfiguration().getInt("mapreduce.job.reduces", 1);
 
     // Counters Edges
-    long eEdges = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "EDGES_EMITTED");
     long eRedOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_OUTPUT_BYTES");
     long eMapIn = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_INPUT_BYTES");
     long eMapOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_OUTPUT_BYTES");
-    long eMapTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "MAPPER_TIME_MS");
     long eCombTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_TIME_MS");
-    long eRedTime = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "REDUCER_TIME_MS");
     long eCombIn = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_INPUT_BYTES");
     long eCombOut = getCounter(edgesJob.getCounters(), NodesEdgesMetrics.EdgesMetrics.class, "COMBINER_OUTPUT_BYTES");
     int eReducers = edgesJob.getConfiguration().getInt("mapreduce.job.reduces", 1);
@@ -335,7 +333,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.printf("║    5. Output (HDFS): %-15s                           ║%n", String.format("%.2f MB", nRedOut/1_000_000.0));
     System.out.println("║  ------------------------------------------------------------  ║");
     System.out.printf("║    Duration:         %-15s                           ║%n", String.format("%.1f s", nWallTime / 1000.0));
-    System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d nodes", nNodes));
+    System.out.printf("║    Generated Unique: %-15s                           ║%n", String.format("%,d nodes", nUniqueNodes));
     System.out.printf("║    Avg File Size:    %-15s                           ║%n", String.format("%.1f MB (x%d files)", nAvgFileMB, nReducers));
     System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", nOptimalReducers));
 
@@ -350,7 +348,7 @@ public class NodesEdgesGenerator extends Configured implements Tool {
     System.out.printf("║    5. Output (HDFS): %-15s                           ║%n", String.format("%.2f MB", eRedOut/1_000_000.0));
     System.out.println("║  ------------------------------------------------------------  ║");
     System.out.printf("║    Duration:         %-15s                           ║%n", String.format("%.1f s", eWallTime / 1000.0));
-    System.out.printf("║    Generated:        %-15s                           ║%n", String.format("%,d edges", eEdges));
+    System.out.printf("║    Generated Unique: %-15s                           ║%n", String.format("%,d edges", eUniqueEdges));
     System.out.printf("║    Avg File Size:    %-15s                           ║%n", String.format("%.1f MB (x%d files)", eAvgFileMB, eReducers));
     System.out.printf("║    Suggestion:       %-15s                           ║%n", String.format("Use ~%d reducers", eOptimalReducers));
     
